@@ -3,23 +3,34 @@
     Author:        Jan Wielemaker
     E-mail:        J.Wielemaker@vu.nl
     WWW:           http://www.swi-prolog.org
-    Copyright (C): 2002-2013, University of Amsterdam
-			      VU University Amsterdam
+    Copyright (c)  2003-2016, University of Amsterdam
+                              VU University Amsterdam
+    All rights reserved.
 
-    This library is free software; you can redistribute it and/or
-    modify it under the terms of the GNU Lesser General Public
-    License as published by the Free Software Foundation; either
-    version 2.1 of the License, or (at your option) any later version.
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions
+    are met:
 
-    This library is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-    Lesser General Public License for more details.
+    1. Redistributions of source code must retain the above copyright
+       notice, this list of conditions and the following disclaimer.
 
-    You should have received a copy of the GNU Lesser General Public
-    License along with this library; if not, write to the Free Software
-    Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
-    02110-1301  USA
+    2. Redistributions in binary form must reproduce the above copyright
+       notice, this list of conditions and the following disclaimer in
+       the documentation and/or other materials provided with the
+       distribution.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+    "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+    LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+    FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+    COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+    INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+    BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+    LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+    CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+    LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+    ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+    POSSIBILITY OF SUCH DAMAGE.
 */
 
 #ifdef HAVE_CONFIG_H
@@ -86,14 +97,18 @@ static functor_t FUNCTOR_hash3;
 static functor_t FUNCTOR_hash4;
 
 static functor_t FUNCTOR_exact1;
+static functor_t FUNCTOR_icase1;
 static functor_t FUNCTOR_plain1;
 static functor_t FUNCTOR_substring1;
 static functor_t FUNCTOR_word1;
 static functor_t FUNCTOR_prefix1;
 static functor_t FUNCTOR_like1;
+static functor_t FUNCTOR_lt1;
 static functor_t FUNCTOR_le1;
+static functor_t FUNCTOR_eq1;
 static functor_t FUNCTOR_between2;
 static functor_t FUNCTOR_ge1;
+static functor_t FUNCTOR_gt1;
 
 static functor_t FUNCTOR_symmetric1;
 static functor_t FUNCTOR_inverse_of1;
@@ -123,6 +138,7 @@ static functor_t FUNCTOR_create_graph1;
 
 static atom_t   ATOM_user;
 static atom_t	ATOM_exact;
+static atom_t	ATOM_icase;
 static atom_t	ATOM_plain;
 static atom_t	ATOM_prefix;
 static atom_t	ATOM_substring;
@@ -139,8 +155,13 @@ static atom_t	ATOM_size;
 static atom_t	ATOM_optimize_threshold;
 static atom_t	ATOM_average_chain_len;
 static atom_t	ATOM_reset;
+static atom_t	ATOM_lt;		/* < */
+static atom_t	ATOM_eq;		/* = */
+static atom_t	ATOM_gt;		/* > */
 
 static atom_t	ATOM_subPropertyOf;
+static atom_t	ATOM_xsdString;
+static atom_t	ATOM_xsdDouble;
 
 static predicate_t PRED_call1;
 
@@ -149,6 +170,7 @@ static predicate_t PRED_call1;
 #define MATCH_SRC		0x04	/* Match graph location */
 #define MATCH_INVERSE		0x08	/* use symmetric match too */
 #define MATCH_QUAL		0x10	/* Match qualifiers too */
+#define MATCH_NUMERIC		0x20	/* Match typed objects numerically */
 #define MATCH_DUPLICATE		(MATCH_EXACT|MATCH_QUAL)
 
 static int match_triples(rdf_db *db, triple *t, triple *p,
@@ -178,6 +200,8 @@ static int	free_literal(rdf_db *db, literal *lit);
 static int	check_predicate_cloud(predicate_cloud *c);
 static void	invalidate_is_leaf(predicate *p, query *q, int add);
 static void	create_triple_hashes(rdf_db *db, int count, int *ic);
+static void	free_literal_value(rdf_db *db, literal *lit);
+static void	finalize_graph(void *g, void *db);
 
 
 		 /*******************************
@@ -191,6 +215,7 @@ INIT_LOCK(rdf_db *db)
   simpleMutexInit(&db->locks.gc);
   simpleMutexInit(&db->locks.duplicates);
   simpleMutexInit(&db->locks.erase);
+  simpleMutexInit(&db->locks.prefixes);
 }
 
 static simpleMutex rdf_lock;
@@ -808,6 +833,222 @@ add_tripleset(search_state *state, tripleset *ts, triple *triple)
 
   return 1;
 }
+
+
+		 /*******************************
+		 *	      PREFIXES		*
+		 *******************************/
+
+static prefix_table *
+new_prefix_table(void)
+{ prefix_table *t = malloc(sizeof(*t));
+
+  if ( t )
+  { memset(t, 0, sizeof(*t));
+    t->size    = PREFIX_INITIAL_ENTRIES;
+    t->entries = malloc(t->size*sizeof(*t->entries));
+    if ( t->entries )
+    { memset(t->entries, 0, t->size*sizeof(*t->entries));
+    } else
+    { free(t);
+      t = NULL;
+    }
+  }
+
+  return t;
+}
+
+
+static void
+empty_prefix_table(rdf_db *db)
+{ int i;
+  prefix_table *t = db->prefixes;
+
+  simpleMutexLock(&db->locks.prefixes);
+  for(i=0; i<t->size; i++)
+  { prefix *p, *next;
+
+    p = t->entries[i];
+    t->entries[i] = NULL;
+    for(; p; p = next)
+    { next = p->next;
+
+      PL_unregister_atom(p->alias);
+      PL_unregister_atom(p->uri.handle);
+      free(p);
+    }
+  }
+  simpleMutexUnlock(&db->locks.prefixes);
+  t->count = 0;
+
+  flush_prefix_cache();
+}
+
+
+static void
+resize_prefix_table(prefix_table *t)
+{ size_t new_size = t->size*2;
+  prefix **new_entries = malloc(new_size*sizeof(*new_entries));
+
+  if ( new_entries )
+  { int i;
+
+    memset(new_entries, 0, new_size*sizeof(*new_entries));
+    for(i=0; i<t->size; i++)
+    { prefix *p, *next;
+
+      for(p=t->entries[i]; p; p = next)
+      { unsigned key = atom_hash(p->alias, MURMUR_SEED) & (new_size-1);
+
+	next = p->next;
+	p->next = new_entries[key];
+	new_entries[key] = p;
+      }
+    }
+
+    t->size = new_size;
+    free(t->entries);
+    t->entries = new_entries;
+  }
+}
+
+
+
+static prefix *
+add_prefix(rdf_db *db, atom_t alias, atom_t uri)
+{ prefix_table *t = db->prefixes;
+  unsigned key = atom_hash(alias, MURMUR_SEED) & (t->size-1);
+  prefix *p = malloc(sizeof(*p));
+
+  if ( !p )
+  { PL_resource_error("memory");
+    return NULL;
+  }
+
+  if ( t->count > t->size )
+    resize_prefix_table(t);
+
+  memset(p, 0, sizeof(*p));
+  p->alias      = alias;
+  p->uri.handle = uri;
+  PL_register_atom(alias);
+  PL_register_atom(uri);
+  fill_atom_info(&p->uri);
+
+  p->next = t->entries[key];
+  t->entries[key] = p;
+  t->count++;
+
+  return p;
+}
+
+
+static prefix *
+lookup_prefix(rdf_db *db, atom_t a)
+{ prefix_table *t;
+  prefix *pl;
+  fid_t fid;
+  static predicate_t pred = NULL;
+
+  simpleMutexLock(&db->locks.prefixes);
+  t = db->prefixes;
+  for(pl = t->entries[atom_hash(a, MURMUR_SEED)&(t->size-1)]; pl; pl=pl->next)
+  { if ( pl->alias == a )
+    { simpleMutexUnlock(&db->locks.prefixes);
+      return pl;
+    }
+  }
+
+  if ( !pred )
+    pred = PL_predicate("rdf_current_prefix", 2, "rdf_db");
+
+  assert(pl == NULL);
+  if ( (fid = PL_open_foreign_frame()) )
+  { term_t av = PL_new_term_refs(2);
+    atom_t uri_atom;
+
+    PL_put_atom(av+0, a);
+    if ( PL_call_predicate(NULL, PL_Q_PASS_EXCEPTION, pred, av) &&
+	 PL_get_atom_ex(av+1, &uri_atom) )
+      pl = add_prefix(db, a, uri_atom);
+    else if ( !PL_exception(0) )
+      PL_existence_error("rdf_prefix", av+0);
+
+    PL_close_foreign_frame(fid);
+  }
+
+  simpleMutexUnlock(&db->locks.prefixes);
+
+  return pl;
+}
+
+
+static wchar_t *
+add_text(wchar_t *w, const text *t)
+{ if ( t->a )
+  { const unsigned char *a = t->a;
+    const unsigned char *e = &a[t->length];
+
+    for(; a<e; a++)
+      *w++ = *a;
+  } else
+  { const wchar_t *a = t->w;
+    const wchar_t *e = &a[t->length];
+
+    for(; a<e; a++)
+      *w++ = *a;
+  }
+
+  return w;
+}
+
+
+atom_t
+expand_prefix(rdf_db *db, atom_t alias, atom_t local)
+{ prefix *p = lookup_prefix(db, alias);
+
+  if ( p )
+  { atom_info ai = {0};
+    ai.handle = local;
+    fill_atom_info(&ai);
+    atom_t uri;
+
+    if ( ai.text.a && p->uri.text.a )
+    { char buf[256];
+      size_t len = ai.text.length + p->uri.text.length;
+      char *a = len <= sizeof(buf) ? buf : malloc(len);
+
+      if ( !len )
+	return (atom_t)0;
+      memcpy(a, p->uri.text.a, p->uri.text.length);
+      memcpy(&a[p->uri.text.length], ai.text.a, ai.text.length);
+
+      uri = PL_new_atom_nchars(len, a);
+      if ( a != buf )
+	free(a);
+    } else
+    { wchar_t buf[256];
+      size_t len = ai.text.length + p->uri.text.length;
+      wchar_t *w = len <= sizeof(buf)/sizeof(wchar_t)
+				   ? buf
+				   : malloc(len*sizeof(wchar_t));
+
+      if ( !len )
+	return (atom_t)0;
+      w = add_text(w, &p->uri.text);
+      w = add_text(w, &ai.text);
+
+      uri = PL_new_atom_wchars(len, w);
+      if ( w != buf )
+	free(w);
+    }
+
+    return uri;
+  }
+
+  return (atom_t)0;
+}
+
 
 
 #ifdef COMPACT
@@ -2091,7 +2332,11 @@ print_reachability_cloud(rdf_db *db, predicate *p, int all)
   Sdprintf("Cloud has %d members, hash = 0x%x\n", cloud->size, cloud->hash);
   check_predicate_cloud(cloud);
 
-  q = open_query(db);
+  if ( !(q = open_query(db)) )
+  { Sdprintf("No more open queries\n");
+    return;
+  }
+
   for(rm=cloud->reachable; rm; rm=rm->older)
   { char b[2][24];
 
@@ -2284,9 +2529,9 @@ object_branch_factor(rdf_db *db, predicate *p, query *q, int which)
 
 static int
 init_graph_table(rdf_db *db)
-{ size_t bytes = sizeof(graph**)*INITIAL_PREDICATE_TABLE_SIZE;
+{ size_t bytes = sizeof(graph**)*INITIAL_GRAPH_TABLE_SIZE;
   graph **p = PL_malloc_uncollectable(bytes);
-  int i, count = INITIAL_PREDICATE_TABLE_SIZE;
+  int i, count = INITIAL_GRAPH_TABLE_SIZE;
 
   memset(p, 0, bytes);
   for(i=0; i<MSB(count); i++)
@@ -2295,6 +2540,7 @@ init_graph_table(rdf_db *db)
   db->graphs.bucket_count       = count;
   db->graphs.bucket_count_epoch = count;
   db->graphs.count              = 0;
+  db->graphs.erased             = 0;
 
   return TRUE;
 }
@@ -2377,7 +2623,7 @@ lookup_graph(rdf_db *db, atom_t name)
 { graph *g, **gp;
   int entry;
 
-  if ( (g=existing_graph(db, name)) )
+  if ( (g=existing_graph(db, name)) && !g->erased )
     return g;
 
   LOCK_MISC(db);
@@ -2426,8 +2672,50 @@ erase_graphs(rdf_db *db)
     }
   }
 
-  db->graphs.count = 0;
-  db->last_graph = NULL;
+  db->graphs.count  = 0;
+  db->graphs.erased = 0;
+  db->last_graph    = NULL;
+}
+
+
+static int
+gc_graphs(rdf_db *db, gen_t gen)
+{ int reclaimed = 0;
+
+  if ( db->graphs.erased > 10 + db->graphs.count/2 )
+  { int i;
+
+    LOCK_MISC(db);
+    for(i=0; i<db->graphs.bucket_count; i++)
+    { graph *p, *n, *g;
+
+      p = NULL;
+      g = db->graphs.blocks[MSB(i)][i];
+
+      for( ; g; g = n )
+      { n = g->next;
+
+	if ( g->erased && g->triple_count == 0 )
+	{ if ( p )
+	    p->next = g->next;
+	  else
+	    db->graphs.blocks[MSB(i)][i] = g->next;
+
+	  if ( db->last_graph == g )
+	    db->last_graph = NULL;
+	  db->graphs.count--;
+	  db->graphs.erased--;
+	  reclaimed++;
+	  deferred_finalize(&db->defer_all, g,
+			    finalize_graph, db);
+	} else
+	  p = g;
+      }
+    }
+    UNLOCK_MISC(db);
+  }
+
+  return reclaimed;
 }
 
 
@@ -2466,18 +2754,19 @@ unregister_graph(rdf_db *db, triple *t)
   if ( db->last_graph && db->last_graph->name == ID_ATOM(t->graph_id) )
   { src = db->last_graph;
   } else
-  { src = lookup_graph(db, ID_ATOM(t->graph_id));
-    db->last_graph = src;
+  { src = existing_graph(db, ID_ATOM(t->graph_id));
   }
 
-  ATOMIC_SUB(&src->triple_count, 1);
+  if ( src )
+  { ATOMIC_SUB(&src->triple_count, 1);
 #ifdef WITH_MD5
-  if ( src->md5 )
-  { md5_byte_t digest[16];
-    md5_triple(t, digest);
-    dec_digest(src->digest, digest);
-  }
+    if ( src->md5 )
+    { md5_byte_t digest[16];
+      md5_triple(t, digest);
+      dec_digest(src->digest, digest);
+    }
 #endif
+  }
 }
 
 
@@ -2654,6 +2943,26 @@ rdf_create_graph(term_t graph_name)
 }
 
 
+static void
+clean_atom(atom_t *ap)
+{ atom_t old;
+
+  if ( (old=*ap) )
+  { *ap = 0;
+    PL_unregister_atom(old);
+  }
+}
+
+
+static void
+finalize_graph(void *mem, void *clientdata)
+{ graph *g = mem;
+  (void)clientdata;
+
+  clean_atom(&g->name);
+}
+
+
 static foreign_t
 rdf_destroy_graph(term_t graph_name)
 { atom_t gn;
@@ -2664,17 +2973,13 @@ rdf_destroy_graph(term_t graph_name)
     return FALSE;
 
   if ( (g = existing_graph(db, gn)) )
-  { atom_t a;
-
-    LOCK_MISC(db);
-    if ( (a=g->source) )
-    { g->source = 0;
-      PL_unregister_atom(a);
-    }
+  { LOCK_MISC(db);
     memset(g->digest,            0, sizeof(g->digest));
     memset(g->unmodified_digest, 0, sizeof(g->unmodified_digest));
+    clean_atom(&g->source);
     g->modified = 0.0;
     g->erased = TRUE;
+    db->graphs.erased++;
     UNLOCK_MISC(db);
   }
 
@@ -2771,21 +3076,35 @@ new_literal(rdf_db *db)
 
 
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-FIXME: rdf_broadcast(EV_OLD_LITERAL,...) happens with   the literal lock
-helt. Needs better merging with  free_literal()   to  reduce locking and
-avoid this problem.
+free_literal_value() gets rid of atoms or term   that forms the value of
+the literal. We cannot dispose of  these   immediately  as they might be
+needed by an ongoing  scan  of   the  literal  skiplist  for comparison.
+Therefore, we use deferred_finalize() and dispose of the triple later.
+
+Return TRUE if the triple value  could   be  distroyed  and FALSE if the
+destruction   has   been   deferred.   That     will   eventually   call
+finalize_literal_ptr(), which calls free_literal_value()  again, but now
+as not shared literal so it can do its work unconditionally.
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
-static int
-free_literal_value(rdf_db *db, literal *lit)
-{ int rc = TRUE;
+static void
+finalize_literal_ptr(void *mem, void *clientdata)
+{ literal **litp = mem;
+  rdf_db *db = clientdata;
+  literal *lit = *litp;
 
-  if ( lit->shared && !db->resetting )
+  free_literal_value(db, lit);
+  rdf_free(db, lit, sizeof(*lit));
+}
+
+
+static literal **
+unlink_literal(rdf_db *db, literal *lit)
+{ if ( lit->shared && !db->resetting )
   { literal_ex lex;
     literal **data;
 
     lit->shared = FALSE;
-    rc = rdf_broadcast(EV_OLD_LITERAL, lit, NULL);
     DEBUG(2,
 	  Sdprintf("Delete %p from literal table: ", lit);
 	  print_literal(lit);
@@ -2795,19 +3114,22 @@ free_literal_value(rdf_db *db, literal *lit)
     prepare_literal_ex(&lex);
 
     if ( (data=skiplist_delete(&db->literals, &lex)) )
-    { unlock_atoms_literal(lit);
-
-      deferred_free(&db->defer_literals, data);	/* someone else may be reading */
+    { return data;
     } else
     { Sdprintf("Failed to delete %p (size=%ld): ", lit, db->literals.count);
       print_literal(lit);
       Sdprintf("\n");
       assert(0);
     }
-  } else
-  { unlock_atoms_literal(lit);
   }
 
+  return NULL;
+}
+
+
+static void
+free_literal_value(rdf_db *db, literal *lit)
+{ unlock_atoms_literal(lit);
   if ( lit->objtype == OBJ_TERM &&
        lit->value.term.record )
   { if ( lit->term_loaded )
@@ -2815,8 +3137,7 @@ free_literal_value(rdf_db *db, literal *lit)
     else
       PL_erase_external(lit->value.term.record);
   }
-
-  return rc;
+  lit->objtype = OBJ_UNTYPED;		/* debugging: trap errors early */
 }
 
 
@@ -2835,17 +3156,23 @@ free_literal(rdf_db *db, literal *lit)
   if ( lit->shared )
   { simpleMutexLock(&db->locks.literal);
     if ( --lit->references == 0 )
-    { rc = free_literal_value(db, lit);
+    { literal **data = unlink_literal(db, lit);
       simpleMutexUnlock(&db->locks.literal);
 
-      rdf_free(db, lit, sizeof(*lit));
+      if ( data )			/* unlinked */
+      { rc = rdf_broadcast(EV_OLD_LITERAL, lit, NULL);
+	deferred_finalize(&db->defer_literals, data,
+			  finalize_literal_ptr, db);
+      } else
+      { free_literal_value(db, lit);
+	rdf_free(db, lit, sizeof(*lit));
+      }
     } else
     { simpleMutexUnlock(&db->locks.literal);
     }
   } else				/* not shared; no locking needed */
   { if ( --lit->references == 0 )
-    { rc = free_literal_value(db, lit);
-
+    { free_literal_value(db, lit);
       rdf_free(db, lit, sizeof(*lit));
     }
   }
@@ -2922,10 +3249,22 @@ compare_literals() sorts literals.  Ordering is defined as:
 
 static int
 cmp_qualifier(const literal *l1, const literal *l2)
-{ if ( l1->qualifier == l2->qualifier )
-    return cmp_atoms(ID_ATOM(l1->type_or_lang), ID_ATOM(l2->type_or_lang));
+{ if ( l1->qualifier != Q_NONE && l1->qualifier == l2->qualifier )
+  { if ( l1->type_or_lang )
+      return cmp_atoms(ID_ATOM(l1->type_or_lang), ID_ATOM(l2->type_or_lang));
+    return -1;
+  }
 
   return l1->qualifier - l2->qualifier;
+}
+
+static xsd_primary
+is_numerical_string(const literal *lit)
+{ if ( lit->objtype == OBJ_STRING &&
+       lit->qualifier == Q_TYPE )
+    return is_numeric_type(ID_ATOM(lit->type_or_lang));
+
+  return XSD_NONNUMERIC;
 }
 
 
@@ -2954,7 +3293,25 @@ compare_literals(literal_ex *lex, literal *l2)
 	break;
       }
       case OBJ_STRING:
-      { rc = cmp_atom_info(&lex->atom, l2->value.string);
+      { if ( lex->atom.handle == l2->value.string &&
+	     l1->type_or_lang == l2->type_or_lang )
+	{ rc = 0;
+	} else
+	{ xsd_primary nt1 = is_numerical_string(l1);
+	  xsd_primary nt2 = is_numerical_string(l2);
+
+	  if ( nt1 || nt2 )
+	  { if ( nt1 && nt2 )
+	    { rc = cmp_xsd_info(nt1, &lex->atom, nt2, l2->value.string);
+	      if ( rc == 0 && nt1 != nt2 )
+		rc = nt1 < nt2 ? 1 : -1;
+	    } else
+	    { rc = nt1 ? -1 : 1;
+	    }
+	  } else
+	  { rc = cmp_atom_info(&lex->atom, l2->value.string);
+	  }
+	}
 	break;
       }
       case OBJ_TERM:
@@ -3011,6 +3368,7 @@ sl_compare_literals(void *p1, void *p2, void *cd)
 #endif
   { literal_ex *lex = p1;
 
+    assert(l2->objtype != OBJ_UNTYPED);
     return compare_literals(lex, l2);
   }
 }
@@ -3891,7 +4249,8 @@ gc_db(rdf_db *db, gen_t gen, gen_t reindex_gen)
   DEBUG(10, Sdprintf("RDF GC; gen = %s\n", gen_name(gen, buf)));
   if ( optimize_triple_hashes(db, gen) >= 0 &&
        gc_hashes(db, gen, reindex_gen) >= 0 &&
-       gc_clouds(db, gen) >= 0 )
+       gc_clouds(db, gen) >= 0 &&
+       gc_graphs(db, gen) >= 0 )
   { db->gc.count++;
     db->gc.last_gen = gen;
     db->gc.last_reindex_gen = reindex_gen;
@@ -4054,6 +4413,7 @@ new_db(void)
   init_tables(db);
   init_triple_array(db);
   init_query_admin(db);
+  db->prefixes = new_prefix_table();
 
   db->duplicate_admin_threshold = DUPLICATE_ADMIN_THRESHOLD;
   db->snapshots.keep = GEN_MAX;
@@ -4425,10 +4785,16 @@ match_literals(int how, literal *p, literal *e, literal *v)
 	     Sdprintf(")\n"); });
 
   switch(how)
-  { case STR_MATCH_LE:
+  { case STR_MATCH_LT:
+      return compare_literals(&lex, v) > 0;
+    case STR_MATCH_LE:
       return compare_literals(&lex, v) >= 0;
+    case STR_MATCH_EQ:
+      return compare_literals(&lex, v) == 0;
     case STR_MATCH_GE:
       return compare_literals(&lex, v) <= 0;
+    case STR_MATCH_GT:
+      return compare_literals(&lex, v) < 0;
     case STR_MATCH_BETWEEN:
       if ( compare_literals(&lex, v) <= 0 )
       { lex.literal = e;
@@ -4440,6 +4806,47 @@ match_literals(int how, literal *p, literal *e, literal *v)
       return FALSE;
     default:
       return match_atoms(how, p->value.string, v->value.string);
+  }
+}
+
+
+static int
+match_numerical(int how, literal *p, literal *e, literal *v)
+{ xsd_primary nv, np;
+  literal_ex lex;
+
+  if ( !(nv=is_numerical_string(v)) )
+    return FALSE;
+  if ( !p->value.string )		/* literal(eq(type(<numeric>,_)),_) */
+    return TRUE;
+
+  np = is_numerical_string(p);
+  assert(np);
+
+  lex.literal = p;
+  prepare_literal_ex(&lex);
+
+  switch(how)
+  { case STR_MATCH_LT:
+      return cmp_xsd_info(np, &lex.atom, nv, v->value.string)  > 0;
+    case STR_MATCH_LE:
+      return cmp_xsd_info(np, &lex.atom, nv, v->value.string) >= 0;
+    case STR_MATCH_GE:
+      return cmp_xsd_info(np, &lex.atom, nv, v->value.string) <= 0;
+    case STR_MATCH_GT:
+      return cmp_xsd_info(np, &lex.atom, nv, v->value.string) <  0;
+    case STR_MATCH_BETWEEN:
+      if ( cmp_xsd_info(np, &lex.atom, nv, v->value.string) <= 0 )
+      { lex.literal = e;
+	prepare_literal_ex(&lex);
+
+	if ( cmp_xsd_info(np, &lex.atom, nv, v->value.string) >= 0 )
+	  return TRUE;
+      }
+      return FALSE;
+    case STR_MATCH_EQ:
+    default:
+      return cmp_xsd_info(np, &lex.atom, nv, v->value.string) == 0;
   }
 }
 
@@ -4459,26 +4866,41 @@ match_object(triple *t, triple *p, unsigned flags)
 
       switch( plit->objtype )
       { case 0:
+	  if ( plit->type_or_lang == ATOM_ID(ATOM_xsdString) &&
+	       tlit->qualifier == Q_NONE )
+	    return TRUE;
 	  if ( plit->qualifier &&
 	       tlit->qualifier != plit->qualifier )
 	    return FALSE;
-	  return TRUE;
-	case OBJ_STRING:
-	  if ( (flags & MATCH_QUAL) ||
-	       p->match == STR_MATCH_PLAIN )
-	  { if ( tlit->qualifier != plit->qualifier )
-	      return FALSE;
-	  } else
-	  { if ( plit->qualifier && tlit->qualifier &&
-		 tlit->qualifier != plit->qualifier )
-	      return FALSE;
-	  }
 	  if ( plit->type_or_lang &&
 	       tlit->type_or_lang != plit->type_or_lang )
 	    return FALSE;
+	  return TRUE;
+	case OBJ_STRING:
+	  /* numeric match */
+	  if ( (flags&MATCH_NUMERIC) )
+	    return match_numerical(p->match, plit, &p->tp.end, tlit);
+	  /* qualifier match */
+	  if ( !( plit->type_or_lang == ATOM_ID(ATOM_xsdString) &&
+		  tlit->qualifier == Q_NONE ) )
+	  { if ( (flags & MATCH_QUAL) ||
+		 p->match == STR_MATCH_PLAIN )
+	    { if ( tlit->qualifier != plit->qualifier )
+		return FALSE;
+	    } else
+	    { if ( plit->qualifier && tlit->qualifier &&
+		   tlit->qualifier != plit->qualifier )
+		return FALSE;
+	    }
+	    if ( plit->type_or_lang &&
+		 tlit->type_or_lang != plit->type_or_lang )
+	      return FALSE;
+	  }
+	  /* lexical match */
 	  if ( plit->value.string )
-	  { if ( tlit->value.string != plit->value.string )
-	    { if ( p->match >= STR_MATCH_EXACT )
+	  { if ( tlit->value.string != plit->value.string ||
+		 p->match == STR_MATCH_LT || p->match == STR_MATCH_GT )
+	    { if ( p->match >= STR_MATCH_ICASE )
 	      { return match_literals(p->match, plit, &p->tp.end, tlit);
 	      } else
 	      { return FALSE;
@@ -4487,15 +4909,15 @@ match_object(triple *t, triple *p, unsigned flags)
 	  }
 	  return TRUE;
 	case OBJ_INTEGER:
-	  if ( p->match >= STR_MATCH_LE )
+	  if ( p->match >= STR_MATCH_LT )
 	    return match_literals(p->match, plit, &p->tp.end, tlit);
 	  return tlit->value.integer == plit->value.integer;
 	case OBJ_DOUBLE:
-	  if ( p->match >= STR_MATCH_LE )
+	  if ( p->match >= STR_MATCH_LT )
 	    return match_literals(p->match, plit, &p->tp.end, tlit);
 	  return tlit->value.real == plit->value.real;
 	case OBJ_TERM:
-	  if ( p->match >= STR_MATCH_LE )
+	  if ( p->match >= STR_MATCH_LT )
 	    return match_literals(p->match, plit, &p->tp.end, tlit);
 	  if ( plit->value.term.record &&
 	       plit->value.term.len != tlit->value.term.len )
@@ -5064,11 +5486,12 @@ rdf_save_db(term_t stream, term_t graph, term_t version)
   if ( v < 2 || v > 3 )
     return PL_domain_error("rdf_db_save_version", version);
 
-  q = open_query(db);
-  rc = save_db(q, out, src, v);
-  close_query(q);
-
-  return rc;
+  if ( (q = open_query(db)) )
+  { rc = save_db(q, out, src, v);
+    close_query(q);
+    return rc;
+  } else
+    return FALSE;
 }
 
 
@@ -5597,10 +6020,14 @@ rdf_load_db(term_t stream, term_t id, term_t graphs)
   }
 
   if ( rc )
-  { query *q = open_query(db);
+  { query *q;
 
-    add_triples(q, ctx.triples.base, ctx.triples.top - ctx.triples.base);
-    close_query(q);
+    if ( (q=open_query(db)) )
+    { add_triples(q, ctx.triples.base, ctx.triples.top - ctx.triples.base);
+      close_query(q);
+    } else
+    { goto error;
+    }
     if ( ctx.graph )
     { if ( ctx.has_digest )
       { sum_digest(ctx.graph->digest, ctx.digest);
@@ -5611,12 +6038,14 @@ rdf_load_db(term_t stream, term_t id, term_t graphs)
     if ( (rc=PL_cons_functor(ba_arg2, FUNCTOR_end1, graphs)) )
       rc = rdf_broadcast(EV_LOAD, (void*)id, (void*)ba_arg2);
     destroy_load_context(db, &ctx, FALSE);
-  } else
-  { rdf_broadcast(EV_LOAD, (void*)id, (void*)ATOM_error);
-    destroy_load_context(db, &ctx, TRUE);
+
+    return rc;
   }
 
-  return rc;
+error:
+  rdf_broadcast(EV_LOAD, (void*)id, (void*)ATOM_error);
+  destroy_load_context(db, &ctx, TRUE);
+  return FALSE;
 }
 
 
@@ -5930,6 +6359,8 @@ get_object(rdf_db *db, term_t object, triple *t)
     _PL_get_arg(1, object, a);
     alloc_literal_triple(db, t);
     return get_literal(db, a, t->object.literal, 0);
+  } else if ( get_prefixed_iri(db, object, &t->object.resource) )
+  { assert(!t->object_is_literal);
   } else
     return PL_type_error("rdf_object", object);
 
@@ -5980,9 +6411,13 @@ get_existing_predicate(rdf_db *db, term_t t, predicate **p)
   if ( !PL_get_atom(t, &name ) )
   { if ( PL_is_functor(t, FUNCTOR_literal1) )
       return 0;				/* rdf(_, literal(_), _) */
-    return PL_type_error("atom", t);
+    if ( get_prefixed_iri(db, t, &name) )
+      goto ok;
+    PL_type_error("rdf_predicate", t);
+    return -1;
   }
 
+ok:
   if ( (*p = existing_predicate(db, name)) )
     return 1;
 
@@ -5995,7 +6430,7 @@ static int
 get_predicate(rdf_db *db, term_t t, predicate **p, query *q)
 { atom_t name;
 
-  if ( !PL_get_atom_ex(t, &name ) )
+  if ( !get_iri_ex(db, t, &name ) )
     return FALSE;
 
   *p = lookup_predicate(db, name);
@@ -6009,7 +6444,7 @@ get_triple(rdf_db *db,
 	   triple *t, query *q)
 { atom_t at;
 
-  if ( !PL_get_atom_ex(subject, &at) ||
+  if ( !get_iri_ex(db, subject, &at) ||
        !get_predicate(db, predicate, &t->predicate.r, q) ||
        !get_object(db, object, t) )
     return FALSE;
@@ -6043,7 +6478,7 @@ get_partial_triple(rdf_db *db,
   if ( subject )
   { atom_t at;
 
-    if ( !get_resource_or_var_ex(subject, &at) )
+    if ( !get_resource_or_var_ex(db, subject, &at) )
       return FALSE;
     t->subject_id = ATOM_ID(at);
   }
@@ -6070,7 +6505,9 @@ get_partial_triple(rdf_db *db,
 
       _PL_get_arg(1, object, a);
       if ( PL_is_functor(a, FUNCTOR_exact1) )
-	t->match = STR_MATCH_EXACT;
+	t->match = STR_MATCH_ICASE;
+      else if ( PL_is_functor(a, FUNCTOR_icase1) )
+	t->match = STR_MATCH_ICASE;
       else if ( PL_is_functor(a, FUNCTOR_plain1) )
 	t->match = STR_MATCH_PLAIN;
       else if ( PL_is_functor(a, FUNCTOR_substring1) )
@@ -6081,10 +6518,16 @@ get_partial_triple(rdf_db *db,
 	t->match = STR_MATCH_PREFIX;
       else if ( PL_is_functor(a, FUNCTOR_like1) )
 	t->match = STR_MATCH_LIKE;
+      else if ( PL_is_functor(a, FUNCTOR_lt1) )
+	t->match = STR_MATCH_LT;
       else if ( PL_is_functor(a, FUNCTOR_le1) )
 	t->match = STR_MATCH_LE;
+      else if ( PL_is_functor(a, FUNCTOR_eq1) )
+	t->match = STR_MATCH_EQ;
       else if ( PL_is_functor(a, FUNCTOR_ge1) )
 	t->match = STR_MATCH_GE;
+      else if ( PL_is_functor(a, FUNCTOR_gt1) )
+	t->match = STR_MATCH_GT;
       else if ( PL_is_functor(a, FUNCTOR_between2) )
       { term_t e = PL_new_term_ref();
 
@@ -6097,7 +6540,7 @@ get_partial_triple(rdf_db *db,
 	return PL_domain_error("match_type", a);
 
       _PL_get_arg(1, a, a);
-      if ( t->match >= STR_MATCH_LE )
+      if ( t->match >= STR_MATCH_LT )
       { if ( !get_literal(db, a, lit, 0) )
 	  return FALSE;
       } else
@@ -6125,7 +6568,7 @@ get_partial_triple(rdf_db *db,
       case OBJ_STRING:
 	if ( lit->objtype == OBJ_STRING )
 	{ if ( lit->value.string &&
-	       t->match <= STR_MATCH_EXACT )
+	       t->match <= STR_MATCH_ICASE )
 	    ipat |= BY_O;
 	}
         break;
@@ -6521,7 +6964,7 @@ start_duplicate_admin(rdf_db *db)
 		 *	    TRANSACTIONS	*
 		 *******************************/
 
-int
+static int
 put_begin_end(term_t t, functor_t be, int level)
 { term_t av;
 
@@ -6539,6 +6982,17 @@ Options:
   Determines query generation
 */
 
+static int
+transaction_depth(const query *q)
+{ int depth = 0;
+
+  for(q=q->transaction; q; q=q->transaction)
+    depth++;
+
+  return depth;
+}
+
+
 static foreign_t
 rdf_transaction(term_t goal, term_t id, term_t options)
 { int rc;
@@ -6555,7 +7009,7 @@ rdf_transaction(term_t goal, term_t id, term_t options)
     term_t arg = PL_new_term_ref();
 
     while( PL_get_list(tail, head, tail) )
-    { int arity;
+    { size_t arity;
       atom_t name;
 
       if ( !PL_get_name_arity(head, &name, &arity) || arity != 1 )
@@ -6582,7 +7036,8 @@ rdf_transaction(term_t goal, term_t id, term_t options)
       return FALSE;
   }
 
-  q = open_transaction(db, &added, &deleted, &updated, ss);
+  if ( !(q = open_transaction(db, &added, &deleted, &updated, ss)) )
+    return FALSE;
   q->transaction_data.prolog_id = id;
   rc = PL_call_predicate(NULL, PL_Q_PASS_EXCEPTION, PRED_call1, goal);
 
@@ -6592,11 +7047,12 @@ rdf_transaction(term_t goal, term_t id, term_t options)
       { discard_transaction(q);
       } else
       { term_t be;
+	int depth = transaction_depth(q);
 
 	if ( !(be=PL_new_term_ref()) ||
-	     !put_begin_end(be, FUNCTOR_begin1, 0) ||
+	     !put_begin_end(be, FUNCTOR_begin1, depth) ||
 	     !rdf_broadcast(EV_TRANSACTION, (void*)id, (void*)be) ||
-	     !put_begin_end(be, FUNCTOR_end1, 0) )
+	     !put_begin_end(be, FUNCTOR_end1, depth) )
 	  return FALSE;
 
 	commit_transaction(q);
@@ -6631,6 +7087,7 @@ rdf_active_transactions(term_t list)
   term_t head = PL_new_term_ref();
   query *t;
 
+  if ( !q ) return FALSE;
   for(t = q->transaction; t; t=t->transaction)
   { if ( !PL_unify_list(tail, head, tail) ||
          !PL_unify(head, t->transaction_data.prolog_id) )
@@ -6657,11 +7114,12 @@ reasoning.
 static foreign_t
 rdf_assert4(term_t subject, term_t predicate, term_t object, term_t src)
 { rdf_db *db = rdf_current_db();
-  triple *t = new_triple(db);
   query *q = open_query(db);
-  triple *d;
+  triple *t, *d;
   triple_walker tw;
 
+  if ( !q ) return FALSE;
+  t = new_triple(db);
   if ( !get_triple(db, subject, predicate, object, t, q) )
   { error:
     free_triple(db, t, FALSE);
@@ -6753,6 +7211,9 @@ init_search_state(search_state *state, query *query)
     return FALSE;
   }
 
+  if ( p->object_is_literal && !is_numerical_string(p->object.literal) )
+    state->flags &= ~MATCH_NUMERIC;
+
   if ( (p->match == STR_MATCH_PREFIX ||	p->match == STR_MATCH_LIKE) &&
        p->indexed != BY_SP &&
        (state->prefix = first_atom(p->object.literal->value.string, p->match)))
@@ -6774,22 +7235,32 @@ init_search_state(search_state *state, query *query)
     { free_search_state(state);
       return FALSE;
     }
-  } else if ( p->indexed != BY_SP && p->match >= STR_MATCH_LE )
+  } else if ( p->indexed != BY_SP && p->match >= STR_MATCH_LT )
   { literal **rlitp;
 
     state->lit_ex.literal = p->object.literal;
     prepare_literal_ex(&state->lit_ex);
 
     switch(p->match)
-    { case STR_MATCH_LE:
+    { case STR_MATCH_LT:
+      case STR_MATCH_LE:
 	rlitp = skiplist_find_first(&state->db->literals,
 				    NULL, &state->literal_state);
         break;
+      case STR_MATCH_GT:
+	rlitp = skiplist_find_first(&state->db->literals,
+				    &state->lit_ex, &state->literal_state);
+        break;
       case STR_MATCH_GE:
+      case STR_MATCH_EQ:
+	if ( (state->flags&MATCH_NUMERIC) ) /* xsd:double is lowest type */
+	  p->object.literal->type_or_lang = ATOM_ID(ATOM_xsdDouble);
 	rlitp = skiplist_find_first(&state->db->literals,
 				    &state->lit_ex, &state->literal_state);
         break;
       case STR_MATCH_BETWEEN:
+	if ( (state->flags&MATCH_NUMERIC) )
+	  p->object.literal->type_or_lang = ATOM_ID(ATOM_xsdDouble);
 	rlitp = skiplist_find_first(&state->db->literals,
 				    &state->lit_ex, &state->literal_state);
         state->lit_ex.literal = &p->tp.end;
@@ -6997,16 +7468,34 @@ next_pattern(search_state *state)
 
 	  break;
 	}
+	case STR_MATCH_LT:
+	  if ( compare_literals(&state->lit_ex, lit) <= 0 )
+	    return FALSE;
+	case STR_MATCH_EQ:
 	case STR_MATCH_LE:
 	case STR_MATCH_BETWEEN:
-	{ if ( compare_literals(&state->lit_ex, lit) < 0 )
-	  { DEBUG(1,
-		  Sdprintf("LE/BETWEEN(");
-		  print_literal(state->lit_ex.literal);
-		  Sdprintf("): terminated literal iteration from ");
-		  print_literal(lit);
-		  Sdprintf("\n"));
-	    return FALSE;			/* no longer a prefix */
+	{ if ( (state->flags&MATCH_NUMERIC) )
+	  { xsd_primary nt;
+
+	    if ( (nt=is_numerical_string(lit)) )
+	    { xsd_primary np = is_numerical_string(state->lit_ex.literal);
+
+	      if ( cmp_xsd_info(np, &state->lit_ex.atom, nt, lit->value.string) < 0 )
+		return FALSE;			/* no longer smaller/equal */
+
+	      break;
+	    }
+	    return FALSE;
+	  } else
+	  { if ( compare_literals(&state->lit_ex, lit) < 0 )
+	    { DEBUG(1,
+		    Sdprintf("LE/BETWEEN(");
+		    print_literal(state->lit_ex.literal);
+		    Sdprintf("): terminated literal iteration from ");
+		    print_literal(lit);
+		    Sdprintf("\n"));
+	      return FALSE;			/* no longer smaller/equal */
+	    }
 	  }
 
 	  break;
@@ -7050,16 +7539,16 @@ next_search_state(search_state *state)
   if ( (state->flags & MATCH_SUBPROPERTY) )
   { retpred = state->realpred;
     if ( retpred )
-    { if ( PL_is_variable(state->predicate) )
+    { if ( !p->predicate.r )		/* state->predicate is unbound */
       { if ( !PL_unify(state->predicate, retpred) )
 	  return FALSE;
       }
     } else
-    { if ( PL_is_variable(state->predicate) )
+    { if ( !p->predicate.r )
 	retpred = state->predicate;
     }
   } else
-  { retpred = state->predicate;
+  { retpred = p->predicate.r ? 0 : state->predicate;
   }
 
   if ( (t2=state->prefetched) )
@@ -7114,6 +7603,8 @@ rdf(term_t subject, term_t predicate, term_t object,
   switch(PL_foreign_control(h))
   { case PL_FIRST_CALL:
     { query *q = open_query(db);
+
+      if ( !q ) return FALSE;
 
       state = &q->state.search;
       state->query     = q;
@@ -7176,6 +7667,7 @@ Search specifications:
 		literal(substring(X), L)
 		literal(word(X), L)
 		literal(exact(X), L)
+		literal(icase(X), L)
 		literal(prefix(X), L)
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
@@ -7183,21 +7675,21 @@ Search specifications:
 static foreign_t
 rdf3(term_t subject, term_t predicate, term_t object, control_t h)
 { return rdf(subject, predicate, object, 0, 0, h,
-	     MATCH_EXACT);
+	     MATCH_EXACT|MATCH_NUMERIC);
 }
 
 static foreign_t
 rdf4(term_t subject, term_t predicate, term_t object,
      term_t src, control_t h)
 { return rdf(subject, predicate, object, src, 0, h,
-	     MATCH_EXACT|MATCH_SRC);
+	     MATCH_EXACT|MATCH_NUMERIC|MATCH_SRC);
 }
 
 
 static foreign_t
 rdf_has3(term_t subject, term_t predicate, term_t object, control_t h)
 { return rdf(subject, predicate, object, 0, 0, h,
-	     MATCH_SUBPROPERTY|MATCH_INVERSE);
+	     MATCH_EXACT|MATCH_NUMERIC|MATCH_SUBPROPERTY|MATCH_INVERSE);
 }
 
 
@@ -7205,7 +7697,7 @@ static foreign_t
 rdf_has4(term_t subject, term_t predicate, term_t object,
 	term_t realpred, control_t h)
 { return rdf(subject, predicate, object, 0, realpred, h,
-	     MATCH_SUBPROPERTY|MATCH_INVERSE);
+	     MATCH_EXACT|MATCH_NUMERIC|MATCH_SUBPROPERTY|MATCH_INVERSE);
 }
 
 
@@ -7266,42 +7758,83 @@ rdf_estimate_complexity(term_t subject, term_t predicate, term_t object,
 current_literal(?Literals)
 - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
 
+typedef struct cl_state
+{ skiplist_enum sl_state;
+  int		indexed;
+  literal	lit;
+  literal_ex	lit_ex;
+} cl_state;
+
+static int
+indexedLiteral(const literal *lit)
+{ if ( lit->objtype == OBJ_STRING )
+    return lit->value.string != 0;
+  return lit->objtype != OBJ_UNTYPED;
+}
+
+
 static foreign_t
 rdf_current_literal(term_t t, control_t h)
 { rdf_db *db = rdf_current_db();
   literal **data;
-  skiplist_enum *state;
+  cl_state *state;
   int rc;
 
   switch(PL_foreign_control(h))
   { case PL_FIRST_CALL:
-      if ( PL_is_variable(t) )
-      { state = rdf_malloc(db, sizeof(*state));
+      state = rdf_malloc(db, sizeof(*state));
+      memset(state, 0, sizeof(*state));
 
-	data = skiplist_find_first(&db->literals, NULL, state);
+      if ( PL_is_variable(t) )
+      { data = skiplist_find_first(&db->literals, NULL, &state->sl_state);
 	goto next;
       } else
-      { return FALSE;			/* TBD */
+      { if ( !get_literal(db, t, &state->lit, LIT_PARTIAL) )
+	{ rdf_free(db, state, sizeof(*state));
+	  return FALSE;
+	}
+	if ( indexedLiteral(&state->lit) )
+	{ state->lit_ex.literal = &state->lit;
+	  prepare_literal_ex(&state->lit_ex);
+	  data = skiplist_find_first(&db->literals,
+				     &state->lit_ex, &state->sl_state);
+	  state->indexed = TRUE;
+	} else
+	{ data = skiplist_find_first(&db->literals, NULL, &state->sl_state);
+	}
+	goto next;
       }
     case PL_REDO:
       state = PL_foreign_context_address(h);
-      data  = skiplist_find_next(state);
+      data  = skiplist_find_next(&state->sl_state);
     next:
-      for(; data; data=skiplist_find_next(state))
+    { fid_t fid = PL_open_foreign_frame();
+
+      for(; data; data=skiplist_find_next(&state->sl_state))
       { literal *lit = *data;
 
 	if ( unify_literal(t, lit) )
-	{ PL_retry_address(state);
+	{ PL_close_foreign_frame(fid);
+	  PL_retry_address(state);
+	} else if ( PL_exception(0) )
+	{ break;
+	} else if ( state->indexed &&
+		    compare_literals(&state->lit_ex, lit) > 0 )
+	{ break;
+	} else
+	{ PL_rewind_foreign_frame(fid);
 	}
       }
-
+      PL_close_foreign_frame(fid);
       rc = FALSE;
       goto cleanup;
+    }
     case PL_PRUNED:
+      state = PL_foreign_context_address(h);
       rc = TRUE;
 
     cleanup:
-      state = PL_foreign_context_address(h);
+      free_literal(db, &state->lit);
       rdf_free(db, state, sizeof(*state));
 
       return rc;
@@ -7416,6 +7949,7 @@ rdf_update5(term_t subject, term_t predicate, term_t object, term_t src,
   triple_buffer matches;
   query *q = open_query(db);
 
+  if ( !q ) return FALSE;
   memset(&t, 0, sizeof(t));
 
   if ( !get_src(src, &t) ||
@@ -7495,8 +8029,9 @@ rdf_retractall4(term_t subject, term_t predicate, term_t object, term_t src)
       return TRUE;
   }
 
+  if ( !(q = open_query(db)) )
+    return FALSE;
   init_triple_buffer(&buf);
-  q = open_query(db);
   init_triple_walker(&tw, db, &t, t.indexed);
   while((p=next_triple(&tw)))
   { if ( !(p=alive_triple(q, p)) )
@@ -7735,9 +8270,8 @@ rdf_monitor(term_t goal, term_t mask)
   long msk;
   module_t m = NULL;
 
-  PL_strip_module(goal, &m, goal);
-
-  if ( !PL_get_atom_ex(goal, &name) ||
+  if ( !PL_strip_module(goal, &m, goal) ||
+       !PL_get_atom_ex(goal, &name) ||
        !PL_get_long_ex(mask, &msk) )
     return FALSE;
 
@@ -7781,6 +8315,7 @@ rdf_set_predicate(term_t pred, term_t option)
   query *q = open_query(db);
   int rc;
 
+  if ( !q ) return FALSE;
   if ( !get_predicate(db, pred, &p, q) )
   { rc = FALSE;
     goto out;
@@ -7933,7 +8468,9 @@ next:
 
   if ( !(ep->p = p->next) )
   { if ( ++ep->i >= db->predicates.bucket_count )
-      goto fail;
+    { rdf_free(db, ep, sizeof(*ep));
+      return TRUE;
+    }
   }
   PL_retry_address(ep);
 }
@@ -7964,7 +8501,8 @@ rdf_predicate_property(term_t pred, term_t option, control_t h)
     { functor_t f;
       int rc;
 
-      q = open_query(db);
+      if ( !(q = open_query(db)) )
+	return FALSE;
       if ( PL_is_variable(option) )
       { q->state.predprop.prop = 0;
 	if ( !get_predicate(db, pred, &q->state.predprop.pred, q) )
@@ -8328,7 +8866,8 @@ rdf_reachable(term_t subj, term_t pred, term_t obj,
       if ( PL_is_variable(pred) )
 	return PL_instantiation_error(pred);
 
-      q = open_query(db);
+      if ( !(q = open_query(db)) )
+	return FALSE;
       a = &q->state.tr_search;
       memset(a, 0, sizeof(*a));
       a->query = q;
@@ -8614,6 +9153,7 @@ rdf_generation(term_t t)
   query *q = open_query(db);
   int rc;
 
+  if ( !q ) return FALSE;
   if ( q->tr_gen > q->stack->tr_gen_base )
   { assert(q->tr_gen < q->stack->tr_gen_max);
 
@@ -8640,6 +9180,8 @@ rdf_snapshot(term_t t)
 { rdf_db *db = rdf_current_db();
   snapshot *s = new_snapshot(db);
 
+  if ( !s )
+    return FALSE;
   return unify_snapshot(t, s);
 }
 
@@ -8750,7 +9292,7 @@ rdf_warm_indexes(term_t indexes)
   while(PL_get_list_ex(tail, head, tail))
   { char *s;
 
-    if ( PL_get_chars(head, &s, CVT_ATOM|CVT_EXCEPTION) )
+    if ( PL_get_chars(head, &s, CVT_ATOM|CVT_STRING|CVT_EXCEPTION) )
     { int by = 0;
       int i;
 
@@ -8772,7 +9314,7 @@ rdf_warm_indexes(term_t indexes)
 	  break;
       }
       if ( i == ic )
-	il[ic++] = by;
+	il[ic++] = ICOL(by);
     } else
       return 0;
   }
@@ -8780,6 +9322,16 @@ rdf_warm_indexes(term_t indexes)
     return FALSE;
 
   create_triple_hashes(db, ic, il);
+
+  return TRUE;
+}
+
+
+static foreign_t
+pl_empty_prefix_table(void)
+{ rdf_db *db = rdf_current_db();
+
+  empty_prefix_table(db);
 
   return TRUE;
 }
@@ -8858,6 +9410,7 @@ reset_db(rdf_db *db)
   erase_predicates(db);
   erase_resources(&db->resources);
   erase_graphs(db);
+  empty_prefix_table(db);
   db->agenda_created = 0;
   skiplist_destroy(&db->literals);
 
@@ -8891,7 +9444,8 @@ rdf_reset_db(void)
   int rc;
 
   db->resetting = TRUE;
-  q = open_query(db);
+  if ( !(q = open_query(db)) )
+    return FALSE;
 
   if ( q->depth > 0 || q->transaction )
   { close_query(q);
@@ -8972,18 +9526,34 @@ rdf_checks_literal_references(term_t l)
 		 *******************************/
 
 
+static int
+get_text_ex(term_t term, text *txt)
+{ memset(txt, 0, sizeof(*txt));
+
+  return ( PL_get_nchars(term, &txt->length, (char**)&txt->a,
+			 CVT_ATOM|CVT_STRING) ||
+	   PL_get_wchars(term, &txt->length, (pl_wchar_t**)&txt->w,
+			 CVT_ATOM|CVT_STRING|CVT_EXCEPTION)
+	 );
+}
+
+
+
 static foreign_t
 match_label(term_t how, term_t search, term_t label)
-{ atom_t h, f, l;
+{ atom_t h;
+  text f, l;
   int type;
 
   if ( !PL_get_atom_ex(how, &h) ||
-       !PL_get_atom_ex(search, &f) ||
-       !PL_get_atom_ex(label, &l) )
+       !get_text_ex(search, &f) ||
+       !get_text_ex(label, &l) )
     return FALSE;
 
   if ( h == ATOM_exact )
-    type = STR_MATCH_EXACT;
+    type = STR_MATCH_ICASE;
+  if ( h == ATOM_icase )
+    type = STR_MATCH_ICASE;
   else if ( h == ATOM_substring )
     type = STR_MATCH_SUBSTRING;
   else if ( h == ATOM_word )
@@ -8995,7 +9565,7 @@ match_label(term_t how, term_t search, term_t label)
   else
     return PL_domain_error("search_method", how);
 
-  return match_atoms(type, f, l);
+  return match_text(type, &f, &l);
 }
 
 
@@ -9011,6 +9581,60 @@ lang_matches(term_t lang, term_t pattern)
 }
 
 
+static foreign_t
+rdf_compare(term_t dif, term_t a, term_t b)
+{ triple ta, tb;
+  rdf_db *db = rdf_current_db();
+  int rc;
+
+  memset(&ta, 0, sizeof(ta));
+  memset(&tb, 0, sizeof(tb));
+  if ( get_object(db, a, &ta) &&
+       get_object(db, b, &tb) )
+  { int d;
+    atom_t ad;
+
+    if ( ta.object_is_literal &&
+	 tb.object_is_literal )
+    { literal_ex lex;
+      lex.literal = ta.object.literal;
+      prepare_literal_ex(&lex);
+      d = compare_literals(&lex, tb.object.literal);
+    } else if ( !ta.object_is_literal && !tb.object_is_literal )
+    { d = cmp_atoms(ta.object.resource, tb.object.resource);
+    } else
+    { d = ta.object_is_literal ? -1 : 1;
+    }
+
+    ad = d < 0 ? ATOM_lt : d > 0 ? ATOM_gt : ATOM_eq;
+
+    rc = PL_unify_atom(dif, ad);
+  } else
+  { rc = FALSE;
+  }
+
+  free_triple(db, &ta, FALSE);
+  free_triple(db, &tb, FALSE);
+
+  return rc;
+}
+
+
+		 /*******************************
+		 *	       TEST		*
+		 *******************************/
+
+static foreign_t
+rdf_is_bnode(term_t t)
+{ size_t len;
+  char *s;
+
+  if ( PL_get_nchars(t, &len, &s, CVT_ATOM) &&
+       s[0] == '_' && (s[1] == ':' || s[1] == '_') )
+    return TRUE;
+
+  return FALSE;
+}
 
 
 		 /*******************************
@@ -9052,14 +9676,18 @@ install_rdf_db(void)
   MKFUNCTOR(graph, 1);
   MKFUNCTOR(indexed, 16);
   MKFUNCTOR(exact, 1);
+  MKFUNCTOR(icase, 1);
   MKFUNCTOR(plain, 1);
   MKFUNCTOR(substring, 1);
   MKFUNCTOR(word, 1);
   MKFUNCTOR(prefix, 1);
   MKFUNCTOR(like, 1);
+  MKFUNCTOR(lt, 1);
   MKFUNCTOR(le, 1);
   MKFUNCTOR(between, 2);
+  MKFUNCTOR(eq, 1);
   MKFUNCTOR(ge, 1);
+  MKFUNCTOR(gt, 1);
   MKFUNCTOR(literal, 2);
   MKFUNCTOR(searched_nodes, 1);
   MKFUNCTOR(duplicates, 1);
@@ -9095,12 +9723,15 @@ install_rdf_db(void)
 
   ATOM_user		  = PL_new_atom("user");
   ATOM_exact		  = PL_new_atom("exact");
+  ATOM_icase		  = PL_new_atom("icase");
   ATOM_plain		  = PL_new_atom("plain");
   ATOM_prefix		  = PL_new_atom("prefix");
   ATOM_like		  = PL_new_atom("like");
   ATOM_substring	  = PL_new_atom("substring");
   ATOM_word		  = PL_new_atom("word");
   ATOM_subPropertyOf	  = PL_new_atom(URL_subPropertyOf);
+  ATOM_xsdString	  = PL_new_atom(URL_xsdString);
+  ATOM_xsdDouble	  = PL_new_atom(URL_xsdDouble);
   ATOM_error		  = PL_new_atom("error");
   ATOM_begin		  = PL_new_atom("begin");
   ATOM_end		  = PL_new_atom("end");
@@ -9112,6 +9743,9 @@ install_rdf_db(void)
   ATOM_optimize_threshold = PL_new_atom("optimize_threshold");
   ATOM_average_chain_len  = PL_new_atom("average_chain_len");
   ATOM_reset		  = PL_new_atom("reset");
+  ATOM_lt		  = PL_new_atom("<");
+  ATOM_eq		  = PL_new_atom("=");
+  ATOM_gt		  = PL_new_atom(">");
 
   PRED_call1         = PL_predicate("call", 1, "user");
 
@@ -9183,7 +9817,9 @@ install_rdf_db(void)
   PL_register_foreign("rdf_active_transactions_",
 					1, rdf_active_transactions, 0);
   PL_register_foreign("rdf_monitor_",   2, rdf_monitor,     META);
-/*PL_register_foreign("rdf_broadcast_", 2, rdf_broadcast,   0);*/
+  PL_register_foreign("rdf_empty_prefix_cache",
+					0, pl_empty_prefix_table, 0);
+  PL_register_foreign("rdf_is_bnode",   1, rdf_is_bnode,    0);
 #ifdef WITH_MD5
   PL_register_foreign("rdf_md5",	2, rdf_md5,	    0);
   PL_register_foreign("rdf_graph_modified_", 3, rdf_graph_modified_, 0);
@@ -9201,6 +9837,7 @@ install_rdf_db(void)
 #endif
 
   PL_register_foreign("lang_matches", 2, lang_matches, 0);
+  PL_register_foreign("rdf_compare",  3, rdf_compare,  0);
 
   install_atom_map();
 }

@@ -1,27 +1,39 @@
 /*  Part of SWI-Prolog
 
     Author:        Jan Wielemaker
-    E-mail:        J.Wielemaker@cs.vu.nl
+    E-mail:        J.Wielemaker@vu.nl
     WWW:           http://www.swi-prolog.org
-    Copyright (C): 2002-2010, University of Amsterdam
-			      VU University Amsterdam
+    Copyright (c)  2006-2016, University of Amsterdam
+                              VU University Amsterdam
+    All rights reserved.
 
-    This library is free software; you can redistribute it and/or
-    modify it under the terms of the GNU Lesser General Public
-    License as published by the Free Software Foundation; either
-    version 2.1 of the License, or (at your option) any later version.
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions
+    are met:
 
-    This library is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-    Lesser General Public License for more details.
+    1. Redistributions of source code must retain the above copyright
+       notice, this list of conditions and the following disclaimer.
 
-    You should have received a copy of the GNU Lesser General Public
-    License along with this library; if not, write to the Free Software
-    Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
-    02110-1301  USA
+    2. Redistributions in binary form must reproduce the above copyright
+       notice, this list of conditions and the following disclaimer in
+       the documentation and/or other materials provided with the
+       distribution.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+    "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+    LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+    FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+    COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+    INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+    BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+    LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+    CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+    LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+    ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+    POSSIBILITY OF SUCH DAMAGE.
 */
 
+#include <config.h>
 #include <SWI-Stream.h>
 #include <SWI-Prolog.h>
 #include "rdf_db.h"
@@ -42,8 +54,8 @@
 		 *	   TEXT HANDLING	*
 		 *******************************/
 
-static inline int
-get_atom_text(atom_t atom, text *txt)
+int
+fetch_atom_text(atom_t atom, text *txt)
 { if ( (txt->a = (const charA*)PL_atom_nchars(atom, &txt->length)) )
   { txt->w = NULL;
     return TRUE;
@@ -57,18 +69,18 @@ get_atom_text(atom_t atom, text *txt)
 }
 
 
-inline wint_t
+static inline wint_t
 fetch(const text *txt, int i)
 { return txt->a ? (wint_t)txt->a[i] : (wint_t)txt->w[i];
 }
 
 
-static int
+int
 fill_atom_info(atom_info *info)
 { if ( !info->resolved )
   { info->resolved = TRUE;
 
-    if ( !(info->rc=get_atom_text(info->handle, &info->text)) )
+    if ( !(info->rc=fetch_atom_text(info->handle, &info->text)) )
     { info->text.a = NULL;
       info->text.w = NULL;
     }
@@ -131,7 +143,7 @@ cmp_atom_info(atom_info *info, atom_t a2)
     return 0;
 
   if ( !fill_atom_info(info) ||
-       !get_atom_text(a2, &t2) )
+       !fetch_atom_text(a2, &t2) )
   { goto cmphandles;			/* non-text atoms? */
   }
 
@@ -287,7 +299,7 @@ atom_t
 first_atom(atom_t a, int match)
 { text t;
 
-  if ( !get_atom_text(a, &t) )
+  if ( !fetch_atom_text(a, &t) )
   { return (atom_t)0;			/* not a textual atom */
   } else
   { size_t len = t.length;
@@ -357,7 +369,7 @@ nextwordA(const charA *s)
 static int
 matchA(int how, const charA *f, const charA *l)
 { switch(how)
-  { case STR_MATCH_EXACT:
+  { case STR_MATCH_ICASE:
     { for( ; *l && *f; l++, f++ )
       { if ( cmp_pointA(*l) != cmp_pointA(*f) )
 	  return FALSE;
@@ -487,23 +499,29 @@ int
 match_atoms(int how, atom_t search, atom_t label)
 { text l, f;
 
-  if ( !get_atom_text(label, &l) ||
-       !get_atom_text(search, &f) )
+  if ( !fetch_atom_text(label, &l) ||
+       !fetch_atom_text(search, &f) )
     return FALSE;			/* error? */
 
-  if ( f.length == 0 )
+  return match_text(how, &f, &l);
+}
+
+
+int
+match_text(int how, text *f, text *l)
+{ if ( f->length == 0 )
     return TRUE;
 
-  if ( f.a && l.a )
-    return matchA(how, f.a, l.a);
+  if ( f->a && l->a )
+    return matchA(how, f->a, l->a);
 
   switch(how)
-  { case STR_MATCH_EXACT:
-    { if ( l.length == f.length )
+  { case STR_MATCH_ICASE:
+    { if ( l->length == f->length )
       { unsigned int i;
 
-	for(i=0; i<l.length; i++ )
-	{ if ( cmp_point(fetch(&l, i)) != cmp_point(fetch(&f, i)) )
+	for(i=0; i<l->length; i++ )
+	{ if ( cmp_point(fetch(l, i)) != cmp_point(fetch(f, i)) )
 	    return FALSE;
 	}
 
@@ -513,11 +531,11 @@ match_atoms(int how, atom_t search, atom_t label)
       return FALSE;
     }
     case STR_MATCH_PREFIX:
-    { if ( f.length <= l.length )
+    { if ( f->length <= l->length )
       { unsigned int i;
 
-	for(i=0; i<f.length; i++ )
-	{ if ( cmp_point(fetch(&l, i)) != cmp_point(fetch(&f, i)) )
+	for(i=0; i<f->length; i++ )
+	{ if ( cmp_point(fetch(l, i)) != cmp_point(fetch(f, i)) )
 	    return FALSE;
 	}
 
@@ -527,12 +545,12 @@ match_atoms(int how, atom_t search, atom_t label)
       return FALSE;
     }
     case STR_MATCH_SUBSTRING:		/* use Boyle-More! */
-    { if ( f.length <= l.length )
+    { if ( f->length <= l->length )
       { unsigned int i, s;
 
-	for(s=0; s+f.length <= l.length; s++)
-	{ for(i=0; i<f.length; i++)
-	  { if ( cmp_point(fetch(&l, i+s)) != cmp_point(fetch(&f, i)) )
+	for(s=0; s+f->length <= l->length; s++)
+	{ for(i=0; i<f->length; i++)
+	  { if ( cmp_point(fetch(l, i+s)) != cmp_point(fetch(f, i)) )
 	      goto snext;
 	  }
 	  return TRUE;
@@ -544,15 +562,15 @@ match_atoms(int how, atom_t search, atom_t label)
       return FALSE;
     }
     case STR_MATCH_WORD:
-    { if ( f.length <= l.length )
+    { if ( f->length <= l->length )
       { unsigned int i, s;
 
-	for(s=0; s+f.length <= l.length; s = nextword(&l, s))
-	{ for(i=0; i<f.length; i++)
-	  { if ( cmp_point(fetch(&l, i+s)) != cmp_point(fetch(&f, i)) )
+	for(s=0; s+f->length <= l->length; s = nextword(l, s))
+	{ for(i=0; i<f->length; i++)
+	  { if ( cmp_point(fetch(l, i+s)) != cmp_point(fetch(f, i)) )
 	      goto wnext;
 	  }
-	  if ( i+s == l.length || !iswalnum(fetch(&l,i+s)) )
+	  if ( i+s == l->length || !iswalnum(fetch(l,i+s)) )
 	    return TRUE;
 
 	wnext:;
@@ -569,19 +587,19 @@ match_atoms(int how, atom_t search, atom_t label)
       chp chps[MAX_LIKE_CHOICES];
       int chn=0;
 
-      for(ip=il=0; il < l.length && ip < f.length; ip++, il++ )
-      { if ( fetch(&f, ip) == '*' )
+      for(ip=il=0; il < l->length && ip < f->length; ip++, il++ )
+      { if ( fetch(f, ip) == '*' )
 	{ ip++;
 
-	  if ( ip == f.length )		/* foo* */
+	  if ( ip == f->length )		/* foo* */
 	    return TRUE;
 
 	search_like:
-	  while ( il < l.length &&
-		  cmp_point(fetch(&l, il)) != cmp_point(fetch(&f, ip)) )
+	  while ( il < l->length &&
+		  cmp_point(fetch(l, il)) != cmp_point(fetch(f, ip)) )
 	    il++;
 
-	  if ( il < l.length )
+	  if ( il < l->length )
 	  { if ( chn >= MAX_LIKE_CHOICES )
 	    { Sdprintf("rdf_db: too many * in `like' expression (>%d)",
 		       MAX_LIKE_CHOICES);
@@ -596,11 +614,11 @@ match_atoms(int how, atom_t search, atom_t label)
 	    goto retry_like;
 	}
 
-	if ( cmp_point(fetch(&l, il)) != cmp_point(fetch(&f, ip)) )
+	if ( cmp_point(fetch(l, il)) != cmp_point(fetch(f, ip)) )
 	  goto retry_like;
       }
-      if ( il == l.length && (ip == f.length ||
-			      (fetch(&f,ip) == '*' && ip+1 == f.length)) )
+      if ( il == l->length && (ip == f->length ||
+			      (fetch(f,ip) == '*' && ip+1 == f->length)) )
 	return TRUE;
 
 retry_like:
@@ -695,8 +713,8 @@ atom_lang_matches(atom_t lang, atom_t pattern)
   if ( pattern == ATOM_star )		/* Everything matches "*" */
     return TRUE;
 
-  if ( !get_atom_text(lang, &s.l) ||
-       !get_atom_text(pattern, &s.p) )
+  if ( !fetch_atom_text(lang, &s.l) ||
+       !fetch_atom_text(pattern, &s.p) )
     return FALSE;			/* exception? */
 
   s.il=0; s.ip=0;

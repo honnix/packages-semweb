@@ -3,43 +3,57 @@
     Author:        Jan Wielemaker
     E-mail:        J.Wielemaker@vu.nl
     WWW:           http://www.swi-prolog.org
-    Copyright (C): 2006-2014, University of Amsterdam
-			      VU University Amsterdam
+    Copyright (c)  2006-2015, University of Amsterdam
+                              VU University Amsterdam
+    All rights reserved.
 
-    This program is free software; you can redistribute it and/or
-    modify it under the terms of the GNU General Public License
-    as published by the Free Software Foundation; either version 2
-    of the License, or (at your option) any later version.
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions
+    are met:
 
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU General Public License for more details.
+    1. Redistributions of source code must retain the above copyright
+       notice, this list of conditions and the following disclaimer.
 
-    You should have received a copy of the GNU General Public
-    License along with this library; if not, write to the Free Software
-    Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
+    2. Redistributions in binary form must reproduce the above copyright
+       notice, this list of conditions and the following disclaimer in
+       the documentation and/or other materials provided with the
+       distribution.
 
-    As a special exception, if you link this library with other files,
-    compiled with a Free Software compiler, to produce an executable, this
-    library does not by itself cause the resulting executable to be covered
-    by the GNU General Public License. This exception does not however
-    invalidate any other reasons why the executable file might be covered by
-    the GNU General Public License.
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+    "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+    LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+    FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+    COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+    INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+    BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+    LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+    CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+    LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+    ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+    POSSIBILITY OF SUCH DAMAGE.
 */
-
 
 :- module(rdf_litindex,
 	  [ rdf_set_literal_index_option/1,	% +Options
 	    rdf_tokenize_literal/2,		% +Literal, -Tokens
+	    rdf_find_literal/2,			% +Spec, -Literal
 	    rdf_find_literals/2,		% +Spec, -ListOfLiterals
-	    rdf_token_expansions/2		% +Spec, -Expansions
+	    rdf_token_expansions/2,		% +Spec, -Expansions
+	    rdf_stopgap_token/1,		% -Token
+
+	    rdf_literal_index/2,		% +Type, -Index
+	    rdf_delete_literal_index/1		% +Type
 	  ]).
 :- use_module(rdf_db).
 :- use_module(library(debug)).
 :- use_module(library(lists)).
 :- use_module(library(error)).
+:- use_module(library(apply)).
+:- if(exists_source(library(snowball))).
+:- use_module(library(snowball)).
+:- else.
 :- use_module(library(porter_stem)).
+:- endif.
 :- use_module(library(double_metaphone)).
 
 /** <module> Search literals
@@ -52,8 +66,10 @@ and _sounds like_ (metaphone).  The normal user-level predicate is
 
 :- dynamic
 	literal_map/2,			% Type, -Map
-	new_token/1,			% Hook
-	setting/1.
+	map_building/2,			% Type, -Queue
+	new_token/2,			% Hook
+	setting/1,
+	stopgap/1.
 :- volatile
 	literal_map/2.
 :- multifile
@@ -64,6 +80,7 @@ and _sounds like_ (metaphone).  The normal user-level predicate is
 setting(verbose(false)).		% print progress messages
 setting(index_threads(1)).		% # threads for creating the index
 setting(index(thread(1))).		% Use a thread for incremental updates
+setting(stopgap_threshold(50000)).	% consider token a stopgap over N
 
 %%	rdf_set_literal_index_option(+Options:list)
 %
@@ -82,6 +99,10 @@ setting(index(thread(1))).		% Use a thread for incremental updates
 %		=self= (execute in the same thread), thread(N) (execute
 %		in N concurrent threads) or =default= (depends on number
 %		of cores).
+%
+%		* stopgap_threshold(+Count)
+%		Add a token to the dynamic stopgap set if it appears in
+%		more than Count literals.  The default is 50,000.
 
 rdf_set_literal_index_option([]) :- !.
 rdf_set_literal_index_option([H|T]) :- !,
@@ -104,6 +125,8 @@ check_option(verbose(X)) :- !,
 	must_be(boolean, X).
 check_option(index_threads(Count)) :- !,
 	must_be(nonneg, Count).
+check_option(stopgap_threshold(Count)) :- !,
+	must_be(nonneg, Count).
 check_option(index(How)) :- !,
 	must_be(oneof([default,thread(_),self]), How).
 check_option(Option) :-
@@ -114,7 +137,8 @@ check_option(Option) :-
 		 *	      QUERY		*
 		 *******************************/
 
-%%	rdf_find_literals(+Spec, -Literals)
+%%	rdf_find_literal(+Spec, -Literal) is nondet.
+%%	rdf_find_literals(+Spec, -Literals) is det.
 %
 %	Find literals in the RDF database matching Spec.  Spec is defined
 %	as:
@@ -124,7 +148,8 @@ check_option(Option) :-
 %	Spec ::= or(Spec,Spec)
 %	Spec ::= not(Spec)
 %	Spec ::= sounds(Like)
-%	Spec ::= stem(Like)
+%	Spec ::= stem(Like)		% same as stem(Like, en)
+%	Spec ::= stem(Like, Lang)
 %	Spec ::= prefix(Prefix)
 %	Spec ::= between(Low, High)	% Numerical between
 %	Spec ::= ge(High)		% Numerical greater-equal
@@ -137,10 +162,18 @@ check_option(Option) :-
 %	on elementary tokens. Then we execute   all the conjunctions and
 %	generate the union using ordered-set algorithms.
 %
+%	Stopgaps are ignored. If the final result is only a stopgap, the
+%	predicate fails.
+%
 %	@tbd Exploit ordering of numbers and allow for > N, < N, etc.
+
+rdf_find_literal(Spec, Literal) :-
+	rdf_find_literals(Spec, Literals),
+	member(Literal, Literals).
 
 rdf_find_literals(Spec, Literals) :-
 	compile_spec(Spec, DNF),
+	DNF \== @(stopgap),
 	token_index(Map),
 	lookup(DNF, Map, _, SuperSet),
 	flatten(SuperSet, Set0),
@@ -158,7 +191,7 @@ rdf_token_expansions(sounds(Like), [sounds(Like, Tokens)]) :-
 	metaphone_index(Map),
 	rdf_find_literal_map(Map, [Like], Tokens).
 rdf_token_expansions(stem(Like), [stem(Like, Tokens)]) :-
-	porter_index(Map),
+	stem_index(Map),
 	rdf_find_literal_map(Map, [Like], Tokens).
 rdf_token_expansions(Spec, Expansions) :-
 	compile_spec(Spec, DNF),
@@ -242,9 +275,11 @@ expand_fuzzy(sounds(Like), Or) :- !,
 	;   expand_fuzzy(Like, Or)
 	).
 expand_fuzzy(stem(Like), Or) :- !,
+	expand_fuzzy(stem(Like, en), Or).
+expand_fuzzy(stem(Like, Lang), Or) :- !,
 	(   atom(Like)
-	->  porter_index(Map),
-	    porter_stem(Like, Key),
+	->  stem_index(Map),
+	    stem(Like, Lang, Key),
 	    rdf_find_literal_map(Map, [Key], Tokens),
 	    list_to_or(Tokens, stem(Like), Or)
 	;   expand_fuzzy(Like, Or)
@@ -285,8 +320,12 @@ expand_fuzzy(ge(Low), Or) :- !,
 	token_index(Map),
 	rdf_keys_in_literal_map(Map, ge(Low), Tokens),
 	list_to_or(Tokens, ge(Low), Or).
-expand_fuzzy(Token, Token) :-
-	atomic(Token), !.
+expand_fuzzy(Token, Result) :-
+	atomic(Token), !,
+	(   rdf_stopgap_token(Token)
+	->  Result = @(stopgap)
+	;   Result = Token
+	).
 expand_fuzzy(Token, _) :-
 	throw(error(type_error(Token, boolean_expression), _)).
 
@@ -296,8 +335,12 @@ simplify(Expr, Expr).
 
 simple(and(@(false), _), @(false)).
 simple(and(_, @(false)), @(false)).
+simple(and(@(stopgap), Token), Token).
+simple(and(Token, @(stopgap)), Token).
 simple(or(@(false), X), X).
 simple(or(X, @(false)), X).
+simple(or(@(stopgap), Token), Token).
+simple(or(Token, @(stopgap)), Token).
 
 
 list_to_or([], _, @(false)) :- !.
@@ -381,12 +424,21 @@ dnf1(DNF, DNF).
 %	a monitor hook.
 
 token_index(Map) :-
-	literal_map(tokens, Map), !.
+	literal_map(token, Map), !,
+	wait_for_map(token).
 token_index(Map) :-
 	rdf_new_literal_map(Map),
-	assert(literal_map(tokens, Map)),
-	make_literal_index,
-	verbose('~N', []),
+	assert(literal_map(token, Map)),
+	register_token_updater,
+	message_queue_create(Queue),
+	assert(map_building(token, Queue)),
+	thread_create(make_literal_index(Queue), _,
+		      [ alias('__rdf_tokenizer'),
+			detached(true)
+		      ]),
+	wait_for_map(token).
+
+register_token_updater :-
 	Monitor = [ reset,
 		    new_literal,
 		    old_literal
@@ -400,6 +452,11 @@ token_index(Map) :-
 	;   rdf_monitor(monitor_literal, Monitor)
 	).
 
+make_literal_index(Queue) :-
+	call_cleanup(
+	    make_literal_index,
+	    ( message_queue_destroy(Queue),
+	      retractall(map_building(token, _)))).
 
 %%	make_literal_index
 %
@@ -407,10 +464,12 @@ token_index(Map) :-
 
 make_literal_index :-
 	setting(index_threads(N)), !,
-	threaded_literal_index(N).
+	threaded_literal_index(N),
+	verbose('~N', []).
 make_literal_index :-
 	current_prolog_flag(cpu_count, X),
-	threaded_literal_index(X).
+	threaded_literal_index(X),
+	verbose('~N', []).
 
 threaded_literal_index(N) :-
 	N > 1, !,
@@ -443,13 +502,24 @@ work(Literal) :-
 	fail.
 
 
-%	clean_token_index
+%%	clean_token_index
 %
 %	Clean after a reset.
 
 clean_token_index :-
 	forall(literal_map(_, Map),
-	       rdf_reset_literal_map(Map)).
+	       rdf_reset_literal_map(Map)),
+	retractall(stopgap(_)).
+
+%%	rdf_delete_literal_index(+Type)
+%
+%	Fully delete a literal index
+
+rdf_delete_literal_index(Type) :-
+	must_be(atom, Type),
+	(   retract(literal_map(Type, Map))
+	->  rdf_reset_literal_map(Map)		% destroy is unsafe
+	).
 
 		 /*******************************
 		 *	  THREADED UPDATE	*
@@ -573,19 +643,26 @@ monitor_literal(transaction(end, reset)) :-
 %	Associate the tokens of a literal with the literal itself.
 
 register_literal(Literal) :-
-	(   rdf_tokenize_literal(Literal, Tokens)
-	->  text_of(Literal, Text),
-	    literal_map(tokens, Map),
-	    add_tokens(Tokens, Text, Map)
+	(   rdf_tokenize_literal(Literal, Tokens0)
+	->  sort(Tokens0, Tokens),
+	    text_of(Literal, Lang, Text),
+	    literal_map(token, Map),
+	    add_tokens(Tokens, Lang, Text, Map)
 	;   true
 	).
 
-add_tokens([], _, _).
-add_tokens([H|T], Literal, Map) :-
+add_tokens([], _, _, _).
+add_tokens([H|T], Lang, Literal, Map) :-
 	rdf_insert_literal_map(Map, H, Literal, Keys),
 	(   var(Keys)
-	->  true
-	;   forall(new_token(H), true),
+	->  (   rdf_keys_in_literal_map(Map, key(H), Count),
+	        setting(stopgap_threshold(Threshold)),
+		Count > Threshold
+	    ->	assert(stopgap(H)),
+		rdf_delete_literal_map(Map, H)
+	    ;	true
+	    )
+	;   forall(new_token(H, Lang), true),
 	    (	Keys mod 1000 =:= 0
 	    ->	progress(Map, 'Tokens'),
 		(   Keys mod 10000 =:= 0
@@ -595,7 +672,7 @@ add_tokens([H|T], Literal, Map) :-
 	    ;	true
 	    )
 	),
-	add_tokens(T, Literal, Map).
+	add_tokens(T, Lang, Literal, Map).
 
 
 %%	unregister_literal(+Literal)
@@ -605,11 +682,12 @@ add_tokens([H|T], Literal, Map) :-
 %	that is destroyed.
 
 unregister_literal(Literal) :-
-	text_of(Literal, Text),
+	text_of(Literal, _Lang, Text),
 	(   rdf(_,_,literal(Text))
 	->  true			% still something left
-	;   rdf_tokenize_literal(Literal, Tokens),
-	    literal_map(tokens, Map),
+	;   rdf_tokenize_literal(Literal, Tokens0),
+	    sort(Tokens0, Tokens),
+	    literal_map(token, Map),
 	    del_tokens(Tokens, Text, Map)
 	).
 
@@ -627,7 +705,7 @@ del_tokens([H|T], Literal, Map) :-
 rdf_tokenize_literal(Literal, Tokens) :-
 	tokenization(Literal, Tokens), !.		% Hook
 rdf_tokenize_literal(Literal, Tokens) :-
-	text_of(Literal, Text),
+	text_of(Literal, _Lang, Text),
 	atom(Text),
 	tokenize_atom(Text, Tokens0),
 	select_tokens(Tokens0, Tokens).
@@ -645,79 +723,156 @@ select_tokens([H|T0], T) :-
 	    )
 	;   atom_length(H, 1)
 	->  select_tokens(T0, T)
-	;   no_index_token(H)
+	;   default_stopgap(H)
+	->  select_tokens(T0, T)
+	;   stopgap(H)
 	->  select_tokens(T0, T)
 	;   T = [H|T1],
 	    select_tokens(T0, T1)
 	).
 
+%%	rdf_stopgap_token(-Token) is nondet.
+%
+%	True when Token is a stopgap  token. Currently, this implies one
+%	of:
+%
+%	  - exclude_from_index(token, Token) is true
+%	  - default_stopgap(Token) is true
+%	  - Token is an atom of length 1
+%	  - Token was added to the dynamic stopgap token set because
+%	    it appeared in more than _stopgap_threshold_ literals.
 
-%	no_index_token/1
+rdf_stopgap_token(Token) :-
+	(   var(Token)
+	->  rdf_stopgap_token2(Token)
+	;   rdf_stopgap_token2(Token), !
+	).
+
+rdf_stopgap_token2(Token) :-
+	exclude_from_index(token, Token).
+rdf_stopgap_token2(Token) :-
+	default_stopgap(Token).
+rdf_stopgap_token2(Token) :-
+	atom(Token),
+	atom_length(Token, 1).
+rdf_stopgap_token2(Token) :-
+	stopgap(Token).
+
+%%	default_stopgap(?Token)
 %
 %	Tokens we do not wish to index,   as  they creat huge amounts of
 %	data with little or no value.  Is   there  a more general way to
 %	describe this? Experience shows that simply  word count is not a
 %	good criterium as it often rules out popular domain terms.
 
-no_index_token(and).
-no_index_token(an).
-no_index_token(or).
-no_index_token(of).
-no_index_token(on).
-no_index_token(in).
-no_index_token(this).
-no_index_token(the).
+default_stopgap(and).
+default_stopgap(an).
+default_stopgap(or).
+default_stopgap(of).
+default_stopgap(on).
+default_stopgap(in).
+default_stopgap(this).
+default_stopgap(the).
 
 
-%%	text_of(+LiteralArg, -Text)
+%%	text_of(+LiteralArg, -Lang, -Text) is semidet.
 %
 %	Get the textual  or  (integer)   numerical  information  from  a
-%	literal value.
+%	literal value. Lang  is  the  language   to  use  for  stemming.
+%	Currently we use English for untyped  plain literals or literals
+%	typed xsd:string. Formally, these should not be tokenized, but a
+%	lot of data out there does not tag strings with their language.
 
-text_of(type(_, Text), Text) :- !.
-text_of(lang(_, Text), Text) :- !.
-text_of(Text, Text) :- atom(Text), !.
-text_of(Text, Text) :- integer(Text).
+text_of(type(xsd:string, Text), en, Text) :- !.
+text_of(type(_, Text), -, Text) :- !.
+text_of(lang(Lang, Text), Lang, Text) :- !.
+text_of(Text, en, Text) :- atom(Text), !.
+text_of(Text, -, Text) :- integer(Text).
 
 
 		 /*******************************
-		 *	   PORTER INDEX		*
+		 *	   STEM INDEX		*
 		 *******************************/
 
+%%	stem_index(-Map) is det.
+%
+%	Get the stemming literal index. This index is created on demand.
+%	If some thread is creating the index, other threads wait for its
+%	completion.
 
-porter_index(Map) :-
-	literal_map(porter, Map), !.
-porter_index(Map) :-
+stem_index(Map) :-
+	literal_map(stem, Map), !,
+	wait_for_map(stem).
+stem_index(Map) :-
 	rdf_new_literal_map(Map),
-	assert(literal_map(porter, Map)),
-	fill_porter_index(Map),
-	assert((new_token(Token) :- add_stem(Token, Map))).
+	assert(literal_map(stem, Map)),
+	assert((new_token(Token, Lang) :- add_stem(Token, Lang, Map))),
+	message_queue_create(Queue),
+	assert(map_building(stem, Queue)),
+	thread_create(fill_stem_index(Map, Queue), _,
+		      [ alias('__rdf_stemmer'),
+			detached(true)
+		      ]),
+	wait_for_map(stem).
 
-fill_porter_index(PorterMap) :-
-	token_index(TokenMap),
-	rdf_keys_in_literal_map(TokenMap, all, Tokens),
-	stem(Tokens, PorterMap).
+wait_for_map(MapName) :-
+	(   map_building(MapName, Queue)
+	->  catch(thread_get_message(Queue, _), _, true),
+	    wait_for_map(MapName)
+	;   true
+	).
 
-stem([], _).
-stem([Token|T], Map) :-
+fill_stem_index(StemMap, Queue) :-
+	call_cleanup(
+	    forall(rdf_current_literal(Literal),
+		   stem_literal_tokens(Literal, StemMap)),
+	    ( message_queue_destroy(Queue),
+	      retractall(map_building(stem, _)))).
+
+stem_literal_tokens(Literal, StemMap) :-
+	rdf_tokenize_literal(Literal, Tokens), !,
+	sort(Tokens, Tokens1),
+	text_of(Literal, Lang, _Text),
+	insert_tokens_stem(Tokens1, Lang, StemMap).
+stem_literal_tokens(_,_).
+
+insert_tokens_stem([], _, _).
+insert_tokens_stem([Token|T], Lang, Map) :-
 	(   atom(Token)
-	->  (   porter_stem(Token, Stem)
+	->  (   stem(Token, Lang, Stem)
 	    ->	rdf_insert_literal_map(Map, Stem, Token, Keys),
 		(   integer(Keys),
 		    Keys mod 1000 =:= 0
-		->  progress(Map, 'Porter')
+		->  progress(Map, 'Stem')
 		;   true
 		)
 	    ;	true
 	    )
 	;   true
 	),
-	stem(T, Map).
+	insert_tokens_stem(T, Lang, Map).
 
 
-add_stem(Token, Map) :-
-	porter_stem(Token, Stem),
+add_stem(Token, Lang, Map) :-
+	stem(Lang, Token, Stem),
 	rdf_insert_literal_map(Map, Stem, Token, _).
+
+:- if(current_predicate(snowball/3)).
+stem(Token, LangSpec, Stem) :-
+	main_lang(LangSpec, Lang),
+	downcase_atom(Token, Lower),
+	catch(snowball(Lang, Lower, Stem), _, fail).
+:- else.
+stem(Token, _Lang, Stem) :-
+	downcase_atom(Token, Lower),
+	porter_stem(Lower, Stem).
+:- endif.
+
+main_lang(LangSpec, Lang) :-
+	sub_atom(LangSpec, Before, _, _, -), !,
+	sub_atom(LangSpec, 0, Before, _, Lang).
+main_lang(LangSpec, Lang) :-
+	downcase_atom(LangSpec, Lang).
 
 
 		 /*******************************
@@ -726,23 +881,36 @@ add_stem(Token, Map) :-
 
 
 metaphone_index(Map) :-
-	literal_map(metaphone, Map), !.
+	literal_map(metaphone, Map), !,
+	wait_for_map(metaphone).
 metaphone_index(Map) :-
 	rdf_new_literal_map(Map),
 	assert(literal_map(metaphone, Map)),
-	fill_metaphone_index(Map),
-	assert((new_token(Token) :- add_metaphone(Token, Map))).
+	assert((new_token(Token, Lang) :- add_metaphone(Token, Lang, Map))),
+	message_queue_create(Queue),
+	assert(map_building(metaphone, Queue)),
+	thread_create(fill_metaphone_index(Map, Queue), _,
+		      [ alias('__rdf_metaphone_indexer'),
+			detached(true)
+		      ]),
+	wait_for_map(metaphone).
 
-fill_metaphone_index(PorterMap) :-
+fill_metaphone_index(MetaphoneMap, Queue) :-
+	call_cleanup(
+	    fill_metaphone_index(MetaphoneMap),
+	    ( message_queue_destroy(Queue),
+	      retractall(map_building(metaphone, _)))).
+
+fill_metaphone_index(MetaphoneMap) :-
 	token_index(TokenMap),
 	rdf_keys_in_literal_map(TokenMap, all, Tokens),
-	metaphone(Tokens, PorterMap).
+	metaphone(Tokens, MetaphoneMap).
 
 metaphone([], _).
 metaphone([Token|T], Map) :-
-	(   atom(Token)
-	->  double_metaphone(Token, SoundEx),
-	    rdf_insert_literal_map(Map, SoundEx, Token, Keys),
+	(   atom(Token),
+	    double_metaphone(Token, SoundEx)
+	->  rdf_insert_literal_map(Map, SoundEx, Token, Keys),
 	    (	integer(Keys),
 		Keys mod 1000 =:= 0
 	    ->	progress(Map, 'Metaphone')
@@ -753,9 +921,37 @@ metaphone([Token|T], Map) :-
 	metaphone(T, Map).
 
 
-add_metaphone(Token, Map) :-
+add_metaphone(Token, _Lang, Map) :-
+	atom(Token), !,
 	double_metaphone(Token, SoundEx),
 	rdf_insert_literal_map(Map, SoundEx, Token).
+add_metaphone(_, _, _).
+
+%%	rdf_literal_index(+Type, -Index) is det.
+%
+%	True when Index is a literal map   containing the index of Type.
+%	Type is one of:
+%
+%	  - token
+%	  Tokens are basically words of literal values. See
+%	  rdf_tokenize_literal/2.  The `token` map maps tokens to full
+%	  literal texts.
+%	  - stem
+%	  Index of stemmed tokens.  If the language is available, the
+%	  tokens are stemmed using the matching _snowball_ stemmer.
+%	  The `stem` map maps stemmed to full tokens.
+%	  - metaphone
+%	  Phonetic index of tokens.  The `metaphone` map maps phonetic
+%	  keys to tokens.
+
+rdf_literal_index(token, Map) :- !,
+	token_index(Map).
+rdf_literal_index(stem, Map) :- !,
+	stem_index(Map).
+rdf_literal_index(metaphone, Map) :- !,
+	metaphone_index(Map).
+rdf_literal_index(Type, _Map) :-
+	domain_error(literal_index, Type).
 
 
 		 /*******************************
@@ -775,12 +971,3 @@ progress(Map, Which) :-
 	       [Which, Keys, Values]).
 progress(_,_).
 
-
-		 /*******************************
-		 *	      SANDBOX		*
-		 *******************************/
-
-:- multifile sandbox:safe_primitive/1.
-
-safe_primitive:safe_primitive(rdf_litindex:rdf_find_literals(_,_)).
-safe_primitive:safe_primitive(rdf_litindex:rdf_tokenize_literal(_,_)).

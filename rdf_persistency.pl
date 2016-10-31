@@ -3,29 +3,34 @@
     Author:        Jan Wielemaker
     E-mail:        J.Wielemaker@vu.nl
     WWW:           http://www.swi-prolog.org
-    Copyright (C): 2002-2013, University of Amsterdam
-			      VU University Amsterdam
+    Copyright (c)  2006-2015, University of Amsterdam
+                              VU University Amsterdam
+    All rights reserved.
 
-    This program is free software; you can redistribute it and/or
-    modify it under the terms of the GNU General Public License
-    as published by the Free Software Foundation; either version 2
-    of the License, or (at your option) any later version.
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions
+    are met:
 
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU General Public License for more details.
+    1. Redistributions of source code must retain the above copyright
+       notice, this list of conditions and the following disclaimer.
 
-    You should have received a copy of the GNU Lesser General Public
-    License along with this library; if not, write to the Free Software
-    Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
+    2. Redistributions in binary form must reproduce the above copyright
+       notice, this list of conditions and the following disclaimer in
+       the documentation and/or other materials provided with the
+       distribution.
 
-    As a special exception, if you link this library with other files,
-    compiled with a Free Software compiler, to produce an executable, this
-    library does not by itself cause the resulting executable to be covered
-    by the GNU General Public License. This exception does not however
-    invalidate any other reasons why the executable file might be covered by
-    the GNU General Public License.
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+    "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+    LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+    FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+    COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+    INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+    BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+    LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+    CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+    LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+    ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+    POSSIBILITY OF SUCH DAMAGE.
 */
 
 :- module(rdf_persistency,
@@ -34,6 +39,7 @@
 	    rdf_current_db/1,		% -Directory
 	    rdf_persistency/2,		% +Graph, +Bool
 	    rdf_flush_journals/1,	% +Options
+	    rdf_persistency_property/1,	% ?Property
 	    rdf_journal_file/2,		% ?Graph, ?JournalFile
 	    rdf_snapshot_file/2,	% ?Graph, ?SnapshotFile
 	    rdf_db_to_file/2		% ?Graph, ?FileBase
@@ -43,6 +49,7 @@
 :- use_module(library(lists)).
 :- use_module(library(uri)).
 :- use_module(library(debug)).
+:- use_module(library(option)).
 :- use_module(library(error)).
 :- use_module(library(thread)).
 :- use_module(library(apply)).
@@ -262,6 +269,28 @@ option_type(access(X),			must_be(oneof([read_write,
 						       read_only]), X)).
 
 
+%%	rdf_persistency_property(?Property) is nondet.
+%
+%	True if Property  is  a  property   of  the  current  persistent
+%	database. Currently makes to options   passed to rdf_attach_db/2
+%	available.  Notable  rdf_persistency_property(access(read_only))
+%	is true if the database  is   mounted  in  read-only mode. Other
+%	properties:
+%
+%	  - directory(Dir)
+%	  Directory in which the database resides.
+
+rdf_persistency_property(Property) :-
+	var(Property), !,
+	rdf_persistency_property_(Property).
+rdf_persistency_property(Property) :-
+	rdf_persistency_property_(Property), !.
+
+rdf_persistency_property_(Property) :-
+	rdf_option(Property).
+rdf_persistency_property_(directory(Dir)) :-
+	rdf_directory(Dir).
+
 %%	no_agc(:Goal)
 %
 %	Run Goal with atom garbage collection   disabled. Loading an RDF
@@ -311,15 +340,18 @@ rdf_current_db(Directory) :-
 %
 %		* min_size(+KB)
 %		Only flush if journal is over KB in size.
+%		* graph(+Graph)
+%		Only flush the journal of Graph
 %
 %	@tbd Provide a default for min_size?
 
 rdf_flush_journals(Options) :-
-	forall(rdf_graph(DB),
-	       rdf_flush_journal(DB, Options)).
+	option(graph(Graph), Options, _),
+	forall(rdf_graph(Graph),
+	       rdf_flush_journal(Graph, Options)).
 
-rdf_flush_journal(DB, Options) :-
-	db_files(DB, _SnapshotFile, JournalFile),
+rdf_flush_journal(Graph, Options) :-
+	db_files(Graph, _SnapshotFile, JournalFile),
 	db_file(JournalFile, File),
 	(   \+ exists_file(File)
 	->  true
@@ -327,7 +359,7 @@ rdf_flush_journal(DB, Options) :-
 	    size_file(JournalFile, Size),
 	    Size / 1024 < KB
 	->  true
-	;   create_db(DB)
+	;   create_db(Graph)
 	).
 
 		 /*******************************
@@ -982,17 +1014,22 @@ close_journals :-
 	       catch(close_journal(DB), E,
 		     print_message(error, E))).
 
-%%	create_db(+DB)
+%%	create_db(+Graph)
 %
-%	Create a saved version of DB in corresponding file, close and
+%	Create a saved version of Graph in corresponding file, close and
 %	delete journals.
 
-create_db(DB) :-
-	debug(rdf_persistency, 'Saving DB ~w', [DB]),
-	db_abs_files(DB, Snapshot, Journal),
+create_db(Graph) :-
+	\+ rdf(_,_,_,Graph), !,
+	debug(rdf_persistency, 'Deleting empty Graph ~w', [Graph]),
+	delete_db(Graph).
+create_db(Graph) :-
+	debug(rdf_persistency, 'Saving Graph ~w', [Graph]),
+	close_journal(Graph),
+	db_abs_files(Graph, Snapshot, Journal),
 	atom_concat(Snapshot, '.new', NewSnapshot),
 	(   catch(( create_directory_levels(Snapshot),
-		    rdf_save_db(NewSnapshot, DB)
+		    rdf_save_db(NewSnapshot, Graph)
 		  ), Error,
 		  ( print_message(warning, Error),
 		    fail
@@ -1002,7 +1039,7 @@ create_db(DB) :-
 	    ;   true
 	    ),
 	    rename_file(NewSnapshot, Snapshot),
-	    debug(rdf_persistency, 'Saved DB ~w', [DB])
+	    debug(rdf_persistency, 'Saved Graph ~w', [Graph])
 	;   catch(delete_file(NewSnapshot), _, true)
 	).
 

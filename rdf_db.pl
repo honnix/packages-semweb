@@ -1,31 +1,36 @@
 /*  Part of SWI-Prolog
 
     Author:        Jan Wielemaker
-    E-mail:        J.Wielemaker@cs.vu.nl
+    E-mail:        J.Wielemaker@vu.nl
     WWW:           http://www.swi-prolog.org
-    Copyright (C): 1985-2013, University of Amsterdam
-			      VU University Amsterdam
+    Copyright (c)  2003-2016, University of Amsterdam
+                              VU University Amsterdam
+    All rights reserved.
 
-    This program is free software; you can redistribute it and/or
-    modify it under the terms of the GNU General Public License
-    as published by the Free Software Foundation; either version 2
-    of the License, or (at your option) any later version.
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions
+    are met:
 
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU General Public License for more details.
+    1. Redistributions of source code must retain the above copyright
+       notice, this list of conditions and the following disclaimer.
 
-    You should have received a copy of the GNU Lesser General Public
-    License along with this library; if not, write to the Free Software
-    Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
+    2. Redistributions in binary form must reproduce the above copyright
+       notice, this list of conditions and the following disclaimer in
+       the documentation and/or other materials provided with the
+       distribution.
 
-    As a special exception, if you link this library with other files,
-    compiled with a Free Software compiler, to produce an executable, this
-    library does not by itself cause the resulting executable to be covered
-    by the GNU General Public License. This exception does not however
-    invalidate any other reasons why the executable file might be covered by
-    the GNU General Public License.
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+    "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+    LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+    FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+    COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+    INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+    BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+    LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+    CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+    LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+    ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+    POSSIBILITY OF SUCH DAMAGE.
 */
 
 :- module(rdf_db,
@@ -108,16 +113,18 @@
 	    lang_equal/2,		% +Lang1, +Lang2
 	    lang_matches/2,		% +Lang, +Pattern
 
-	    rdf_current_prefix/2,	% ?Alias, ?URI
+	    rdf_prefix/2,		% :Alias, +URI
+	    rdf_current_prefix/2,	% :Alias, ?URI
 	    rdf_register_prefix/2,	% +Alias, +URI
 	    rdf_register_prefix/3,	% +Alias, +URI, +Options
-	    rdf_current_ns/2,		% ?Alias, ?URI
+	    rdf_current_ns/2,		% :Alias, ?URI
 	    rdf_register_ns/2,		% +Alias, +URI
 	    rdf_register_ns/3,		% +Alias, +URI, +Options
-	    rdf_global_id/2,		% ?NS:Name, ?Global
-	    rdf_global_object/2,	% ?Object, ?NSExpandedObject
-	    rdf_global_term/2,		% Term, WithExpandedNS
+	    rdf_global_id/2,		% ?NS:Name, :Global
+	    rdf_global_object/2,	% ?Object, :NSExpandedObject
+	    rdf_global_term/2,		% Term, :WithExpandedNS
 
+	    rdf_compare/3,		% -Dif, +Object1, +Object2
 	    rdf_match_label/3,		% +How, +String, +Label
 	    rdf_split_url/3,		% ?Base, ?Local, ?URL
 	    rdf_url_namespace/2,	% +URL, ?Base
@@ -147,6 +154,7 @@
 	  ]).
 :- use_module(library(rdf)).
 :- use_module(library(lists)).
+:- use_module(library(pairs)).
 :- use_module(library(shlib)).
 :- use_module(library(gensym)).
 :- use_module(library(sgml)).
@@ -156,6 +164,7 @@
 :- use_module(library(uri)).
 :- use_module(library(debug)).
 :- use_module(library(apply)).
+:- use_module(library(xsdp_types)).
 :- if(exists_source(library(thread))).
 :- use_module(library(thread)).
 :- endif.
@@ -165,6 +174,11 @@
 :- public rdf_print_predicate_cloud/2.	% print matrix of reachable predicates
 
 :- meta_predicate
+	rdf_current_prefix(:, -),
+	rdf_current_ns(:, -),
+	rdf_global_id(+, :),
+	rdf_global_term(+, :),
+	rdf_global_object(+, :),
 	rdf_transaction(0),
 	rdf_transaction(0, +),
 	rdf_transaction(0, +, +),
@@ -179,7 +193,7 @@
 		       cache(boolean),
 		       concurrent(positive_integer),
 		       db(atom),
-		       format(oneof([xml,triples,turtle])),
+		       format(oneof([xml,triples,turtle,trig,nquads,ntriples])),
 		       graph(atom),
 		       if(oneof([true,changed,not_loaded])),
 		       modified(-float),
@@ -215,11 +229,8 @@
 		     [ snapshot(any)
 		     ]).
 
-:- multifile
-	ns/2,
-	rdf_meta_specification/3.	% UnboundHead, Module, Head
-:- dynamic
-	ns/2.			% ID, URL
+:- multifile ns/2.
+:- dynamic   ns/2.			% ID, URL
 :- discontiguous
 	term_expansion/2.
 
@@ -227,19 +238,72 @@
 
 The file library(semweb/rdf_db) provides the core  of the SWI-Prolog RDF
 store.
+
+@deprecated	New applications should use library(semweb/rdf11), which
+		provides a much more intuitive API to the RDF store, notably
+		for handling literals.  The library(semweb/rdf11) runs
+		currently on top of this library and both can run side-by-side
+		in the same application.  Terms retrieved from the database
+		however have a different shape and can not be exchanged without
+		precautions.
 */
 
 		 /*******************************
 		 *	     PREFIXES		*
 		 *******************************/
 
-%%	rdf_current_prefix(?Alias, ?URI) is nondet.
+%%	rdf_current_prefix(:Alias, ?URI) is nondet.
 %
 %	Query   predefined   prefixes   and    prefixes   defined   with
-%	rdf_register_ns/2.
+%	rdf_register_prefix/2   and   local   prefixes    defined   with
+%	rdf_prefix/2. If Alias is unbound and one   URI is the prefix of
+%	another, the longest is returned first.   This  allows turning a
+%	resource into a prefix/local couple using the simple enumeration
+%	below. See rdf_global_id/2.
+%
+%	  ==
+%	  rdf_current_prefix(Prefix, Expansion),
+%	  atom_concat(Expansion, Local, URI),
+%	  ==
 
-rdf_current_prefix(Alias, URI) :-
+rdf_current_prefix(Module:Alias, URI) :-
+	nonvar(Alias), !,
+	rdf_current_prefix(Module, Alias, URI), !.
+rdf_current_prefix(Module:Alias, URI) :-
+	rdf_current_prefix(Module, Alias, URI).
+
+rdf_current_prefix(system, Alias, URI) :- !,
 	ns(Alias, URI).
+rdf_current_prefix(Module, Alias, URI) :-
+	default_module(Module, M),
+	(   M == system
+	->  ns(Alias, URI)
+	;   '$flushed_predicate'(M:'rdf prefix'(_,_)),
+	    call(M:'rdf prefix'(Alias,URI))
+	).
+
+%%	rdf_prefix(:Alias, +URI) is det.
+%
+%	Register a _local_ prefix.  This   declaration  takes precedence
+%	over globally defined prefixes   using  rdf_register_prefix/2,3.
+%	Module local prefixes are notably required   to deal with SWISH,
+%	where users need to  be  able   to  have  independent  namespace
+%	declarations.
+
+rdf_prefix(Alias, URI) :-
+	throw(error(context_error(nodirective, rdf_prefix(Alias, URI)), _)).
+
+system:term_expansion((:- rdf_prefix(AliasSpec, URI)), Clauses) :-
+	prolog_load_context(module, Module),
+	strip_module(Module:AliasSpec, TM, Alias),
+	must_be(atom, Alias),
+	must_be(atom, URI),
+	(   rdf_current_prefix(TM:Alias, URI)
+	->  Clauses = []
+	;   TM == Module
+	->  Clauses = 'rdf prefix'(Alias, URI)
+	;   Clauses = TM:'rdf prefix'(Alias, URI)
+	).
 
 %%	ns(?Alias, ?URI) is nondet.
 %
@@ -249,17 +313,17 @@ rdf_current_prefix(Alias, URI) :-
 %	@deprecated New code  must  modify   the  namespace  table using
 %	rdf_register_ns/3 and query using rdf_current_ns/2.
 
-ns(rdf,	    'http://www.w3.org/1999/02/22-rdf-syntax-ns#').
-ns(rdfs,    'http://www.w3.org/2000/01/rdf-schema#').
-ns(owl,	    'http://www.w3.org/2002/07/owl#').
-ns(xsd,	    'http://www.w3.org/2001/XMLSchema#').
 ns(dc,	    'http://purl.org/dc/elements/1.1/').
 ns(dcterms, 'http://purl.org/dc/terms/').
 ns(eor,	    'http://dublincore.org/2000/03/13/eor#').
-ns(skos,    'http://www.w3.org/2004/02/skos/core#').
 ns(foaf,    'http://xmlns.com/foaf/0.1/').
-ns(void,    'http://rdfs.org/ns/void#').
+ns(owl,	    'http://www.w3.org/2002/07/owl#').
+ns(rdf,	    'http://www.w3.org/1999/02/22-rdf-syntax-ns#').
+ns(rdfs,    'http://www.w3.org/2000/01/rdf-schema#').
 ns(serql,   'http://www.openrdf.org/schema/serql#').
+ns(skos,    'http://www.w3.org/2004/02/skos/core#').
+ns(void,    'http://rdfs.org/ns/void#').
+ns(xsd,	    'http://www.w3.org/2001/XMLSchema#').
 
 %%	rdf_register_prefix(+Prefix, +URI) is det.
 %%	rdf_register_prefix(+Prefix, +URI, +Options) is det.
@@ -274,62 +338,92 @@ ns(serql,   'http://www.openrdf.org/schema/serql#').
 %
 %		* keep(Boolean)
 %		If =true= and Alias is already defined, keep the
-%		original message and succeed silently.
+%		original binding for Prefix and succeed silently.
 %
 %	Without options, an attempt  to  redefine   an  alias  raises  a
 %	permission error.
 %
 %	Predefined prefixes are:
 %
-%	| rdf	  | http://www.w3.org/1999/02/22-rdf-syntax-ns#' |
-%	| rdfs	  | http://www.w3.org/2000/01/rdf-schema#'	 |
-%	| owl	  | http://www.w3.org/2002/07/owl#'		 |
-%	| xsd	  | http://www.w3.org/2001/XMLSchema#'		 |
-%	| dc	  | http://purl.org/dc/elements/1.1/'		 |
-%	| dcterms | http://purl.org/dc/terms/'			 |
-%	| eor	  | http://dublincore.org/2000/03/13/eor#'	 |
-%	| skos	  | http://www.w3.org/2004/02/skos/core#'	 |
-%	| serql	  | http://www.openrdf.org/schema/serql#'	 |
+%	| **Alias** | **IRI prefix**                              |
+%	| dc        | http://purl.org/dc/elements/1.1/            |
+%	| dcterms   | http://purl.org/dc/terms/                   |
+%	| eor       | http://dublincore.org/2000/03/13/eor#       |
+%	| foaf      | http://xmlns.com/foaf/0.1/                  |
+%	| owl       | http://www.w3.org/2002/07/owl#              |
+%	| rdf       | http://www.w3.org/1999/02/22-rdf-syntax-ns# |
+%	| rdfs      | http://www.w3.org/2000/01/rdf-schema#       |
+%	| serql     | http://www.openrdf.org/schema/serql#        |
+%	| skos      | http://www.w3.org/2004/02/skos/core#        |
+%	| void      | http://rdfs.org/ns/void#                    |
+%	| xsd       | http://www.w3.org/2001/XMLSchema#           |
 
 
 rdf_register_prefix(Alias, URI) :-
 	rdf_register_prefix(Alias, URI, []).
 
-rdf_register_prefix(Alias, URI, _) :-
-	ns(Alias, URI), !.
 rdf_register_prefix(Alias, URI, Options) :-
+	must_be(atom, Alias),
+	must_be(atom, URI),
+	(   rdf_current_prefix(system:Alias, URI)
+	->  true
+	;   register_global_prefix(Alias, URI, Options)
+	).
+
+%%	register_global_prefix(+Alias, +URI, +Options)
+%
+%	Register a global prefix.
+
+register_global_prefix(Alias, URI, Options) :-
 	ns(Alias, _), !,
 	(   option(force(true), Options, false)
 	->  retractall(ns(Alias, _)),
-	    assert(ns(Alias, URI))
+	    rdf_register_prefix(Alias, URI, Options),
+	    rdf_empty_prefix_cache
 	;   option(keep(true), Options, false)
 	->  true
 	;   throw(error(permission_error(register, namespace, Alias),
 			context(_, 'Already defined')))
 	).
-rdf_register_prefix(Alias, URI, _) :-
-	assert(ns(Alias, URI)).
+register_global_prefix(Alias, URI, _) :-
+	findall(P-U, prefix_conflict(URI, P, U), Pairs),
+	order_prefixes([Alias-URI|Pairs], Ordered),
+	forall(member(P-U, Pairs), retract(ns(P,U))),
+	forall(member(P-U, Ordered), assert(ns(P,U))).
 
-%%	rdf_current_ns(?Prefix, ?URI) is nondet.
+prefix_conflict(URI, P, U) :-
+	ns(P,U),
+	(   sub_atom(URI, 0, _, _, U)
+	->  true
+	;   sub_atom(U, 0, _, _, URI)
+	).
+
+order_prefixes(Pairs, Sorted) :-
+	map_list_to_pairs(prefix_uri_length, Pairs, ByLen),
+	sort(1, >=, ByLen, SortedByLen),
+	pairs_values(SortedByLen, Sorted).
+
+prefix_uri_length(_-URI, Len) :-
+	atom_length(URI, Len).
+
+%%	rdf_current_ns(:Prefix, ?URI) is nondet.
 %
 %	@deprecated.  Use rdf_current_prefix/2.
 
 rdf_current_ns(Prefix, URI) :-
 	rdf_current_prefix(Prefix, URI).
 
-%%	rdf_register_ns(?Prefix, ?URI) is det.
+%%	rdf_register_ns(:Prefix, ?URI) is det.
+%%	rdf_register_ns(:Prefix, ?URI, +Options) is det.
 %
-%	@deprecated.  Use rdf_register_prefix/2.
-
-%%	rdf_register_ns(?Prefix, ?URI, +Options) is det.
+%	Register an RDF prefix.
 %
-%	@deprecated.  Use rdf_register_prefix/3.
+%	@deprecated. Use rdf_register_prefix/2 or rdf_register_prefix/3.
 
 rdf_register_ns(Prefix, URI) :-
 	rdf_register_prefix(Prefix, URI).
 rdf_register_ns(Prefix, URI, Options) :-
 	rdf_register_prefix(Prefix, URI, Options).
-
 
 
 %%	register_file_ns(+Map:list(pair)) is det.
@@ -360,77 +454,107 @@ register_file_ns(NS-URL) :-
 	).
 
 
-%%	rdf_global_id(?Id, ?GlobalId) is det.
+%%	rdf_global_id(?Id, :GlobalId) is det.
 %
-%	Convert between NS:Local and global atomic identifier.
-%	To be completed.
+%	Convert between NS:Local and  global   atomic  identifier. To be
+%	completed. Note that the predicate is   a  meta-predicate on the
+%	output argument. This is necessary  to   get  the module context
+%	while the first argument may be of the form (:)/2.
 
-rdf_global_id(NS:Local, Global) :-
-	global(NS, Local, Global), !.
-rdf_global_id(Global, Global).
+rdf_global_id(Id, Module:Global) :-
+	rdf_global_id(Id, Global, Module).
+
+rdf_global_id(NS:Local, Global, Module) :-
+	global(NS, Local, Global, Module), !.
+rdf_global_id(Global, Global, _).
 
 
-%%	rdf_global_object(+Object, -GlobalObject) is semidet.
-%%	rdf_global_object(-Object, +GlobalObject) is semidet.
+%%	rdf_global_object(+Object, :GlobalObject) is semidet.
+%%	rdf_global_object(-Object, :GlobalObject) is semidet.
 %
 %	Same as rdf_global_id/2,  but  intended   for  dealing  with the
 %	object part of a  triple,  in   particular  the  type  for typed
-%	literals.
+%	literals. Note that the predicate  is   a  meta-predicate on the
+%	output argument. This is necessary  to   get  the module context
+%	while the first argument may be of the form (:)/2.
 %
-%	@error	existence_error(rdf_namespace, NS)
+%	@error	existence_error(rdf_prefix, Prefix)
 
-rdf_global_object(NS:Local, Global) :-
-	global(NS, Local, Global), !.
-rdf_global_object(literal(type(NS:Local, Value)),
-		  literal(type(Global, Value))) :-
-	global(NS, Local, Global), !.
-rdf_global_object(literal(Query, type(NS:Local, Value)),
-		  literal(Query, type(Global, Value))) :-
-	global(NS, Local, Global), !.
-rdf_global_object(Global, Global).
+rdf_global_object(Object, Module:GlobalObject) :-
+	rdf_global_object(Object, GlobalObject, Module).
 
-global(NS, Local, Global) :-
+rdf_global_object(Var, Global, _M) :-
+	var(Var), !,
+	Global = Var.
+rdf_global_object(Prefix:Local, Global, M) :-
+	global(Prefix, Local, Global, M), !.
+rdf_global_object(literal(type(Prefix:Local, Value)),
+		  literal(type(Global, Value)), M) :-
+	global(Prefix, Local, Global, M), !.
+rdf_global_object(^^(Value,Prefix:Local),
+		  ^^(Value,Global), M) :-
+	global(Prefix, Local, Global, M), !.
+rdf_global_object(literal(Query0, type(Prefix:Local, Value)),
+		  literal(Query1, type(Global, Value)), M) :-
+	global(Prefix, Local, Global, M), !,
+	rdf_global_term(Query0, Query1, M).
+rdf_global_object(literal(Query0, Value),
+		  literal(Query1, Value), M) :- !,
+	rdf_global_term(Query0, Query1, M).
+rdf_global_object(Global, Global, _).
+
+global(Prefix, Local, Global, Module) :-
 	(   atom(Global)
-	->  ns(NS, Full),
+	->  rdf_current_prefix(Module:Prefix, Full),
 	    atom_concat(Full, Local, Global)
-	;   atom(NS), atom(Local)
-	->  (   ns(NS, Full)
+	;   atom(Prefix), atom(Local)
+	->  (   rdf_current_prefix(Module:Prefix, Full)
 	    *->	atom_concat(Full, Local, Global)
 	    ;	current_prolog_flag(xref, true)
-	    ->	Global = NS:Local
-	    ;	existence_error(rdf_namespace, NS)
+	    ->	Global = Prefix:Local
+	    ;	existence_error(rdf_prefix, Prefix)
 	    )
 	).
 
 
-%%	rdf_global_term(+TermIn, -GlobalTerm) is det.
+%%	rdf_global_term(+TermIn, :GlobalTerm) is det.
 %
-%	Does rdf_global_id/2 on all terms NS:Local by recursively analysing
-%	the term.
+%	Does  rdf_global_id/2  on  all  terms  NS:Local  by  recursively
+%	analysing the term. Note that the  predicate is a meta-predicate
+%	on the output argument. This  is   necessary  to  get the module
+%	context while the first argument may be of the form (:)/2.
+%
+%	Terms of the form Prefix:Local that   appear in TermIn for which
+%	Prefix is not defined are   not replaced. Unlike rdf_global_id/2
+%	and rdf_global_object/2, no error is raised.
 
-rdf_global_term(Var, Var) :-
+rdf_global_term(TermIn, Module:TermOut) :-
+	rdf_global_term(TermIn, TermOut, Module).
+
+rdf_global_term(Var, Var, _M) :-
 	var(Var), !.
-rdf_global_term(NS:Local, Global) :-
-	atom(NS), atom(Local), ns(NS, Full), !,
+rdf_global_term(Prefix:Local, Global, Module) :-
+	atom(Prefix), atom(Local),
+	rdf_current_prefix(Module:Prefix, Full), !,
 	atom_concat(Full, Local, Global).
-rdf_global_term([H0|T0], [H|T]) :- !,
-	rdf_global_term(H0, H),
-	rdf_global_term(T0, T).
-rdf_global_term(Term0, Term) :-
+rdf_global_term([H0|T0], [H|T], M) :- !,
+	rdf_global_term(H0, H, M),
+	rdf_global_term(T0, T, M).
+rdf_global_term(Term0, Term, M) :-
 	compound(Term0), !,
 	Term0 =.. [H|L0],
-	rdf_global_term(L0, L),
+	rdf_global_term(L0, L, M),
 	Term =.. [H|L].
-rdf_global_term(Term, Term).
+rdf_global_term(Term, Term, _).
 
-%%	rdf_global_graph(+TermIn, -GlobalTerm) is det.
+%%	rdf_global_graph(+TermIn, -GlobalTerm, +Module) is det.
 %
 %	Preforms rdf_global_id/2 on rdf/4, etc graph arguments
 
-rdf_global_graph(NS:Local, Global) :-
-	atom(NS), atom(Local), !,
-	global(NS, Local, Global).
-rdf_global_graph(G, G).
+rdf_global_graph(Prefix:Local, Global, Module) :-
+	atom(Prefix), atom(Local), !,
+	global(Prefix, Local, Global, Module).
+rdf_global_graph(G, G, _).
 
 
 		 /*******************************
@@ -443,19 +567,29 @@ rdf_global_graph(G, G).
 
 system:term_expansion((:- rdf_meta(Heads)), Clauses) :-
 	prolog_load_context(module, M),
-	mk_clauses(Heads, M, Clauses).
+	phrase(mk_clauses(Heads, M), Clauses).
 
-mk_clauses((A,B), M, [H|T]) :- !,
-	mk_clause(A, M, H),
-	mk_clauses(B, M, T).
-mk_clauses(A, M, [C]) :-
-	mk_clause(A, M, C).
+mk_clauses((A,B), M) -->
+	mk_clause(A, M),
+	mk_clauses(B, M).
+mk_clauses(A, M) -->
+	mk_clause(A, M).
 
-mk_clause(Head0, M0, rdf_db:rdf_meta_specification(Unbound, Module, Head)) :-
-	strip_module(M0:Head0, Module, Head),
-	valid_rdf_meta_head(Head),
-	functor(Head, Name, Arity),
-	functor(Unbound, Name, Arity).
+mk_clause(Head0, M0) -->
+	{ strip_module(M0:Head0, Module, Head),
+	  valid_rdf_meta_head(Head),
+	  functor(Head, Name, Arity),
+	  functor(Unbound, Name, Arity),
+	  qualify(Module, 'rdf meta specification'/2, Decl)
+	},
+	[ (:- multifile(Decl)),
+	  Module:'rdf meta specification'(Unbound, Head)
+	].
+
+qualify(Module, Decl, Decl) :-
+	prolog_load_context(module, Module), !.
+qualify(Module, Decl, Module:Decl).
+
 
 valid_rdf_meta_head(Head) :-
 	callable(Head), !,
@@ -525,82 +659,91 @@ valid_arg(A) :-
 %	=rdf_meta=  is  declared   as   an    operator   exported   from
 %	library(semweb/rdf_db). Files using rdf_meta/1  must explicitely
 %	load this library.
+%
+%	Beginning with SWI-Prolog 7.3.17, the   low-level  RDF interface
+%	(rdf/3,  rdf_assert/3,  etc.)  perform    runtime  expansion  of
+%	`Prefix:Local` terms. This eliminates the   need  for rdf_meta/1
+%	for  simple  cases.  However,  runtime   expansion  comes  at  a
+%	significant overhead and having two  representations for IRIs (a
+%	plain atom and  a  term   `Prefix:Local`)  implies  that  simple
+%	operations such as comparison of IRIs   no  longer map to native
+%	Prolog operations such as `IRI1 == IRI2`.
 
 rdf_meta(Heads) :-
 	throw(error(context_error(nodirective, rdf_meta(Heads)), _)).
 
+%%	rdf_meta_specification(+General, +Module, -Spec) is semidet.
+%
+%	True when Spec is the RDF meta specification for Module:General.
+%
+%	@arg	General is the term Spec with all arguments replaced with
+%		variables.
+
+rdf_meta_specification(Unbounded, Module, Spec) :-
+	'$flushed_predicate'(Module:'rdf meta specification'(_,_)),
+	call(Module:'rdf meta specification'(Unbounded, Spec)).
 
 system:goal_expansion(G, Expanded) :-
-	rdf_meta_specification(G, _, _), !,
+	\+ predicate_property(G, iso),
 	prolog_load_context(module, LM),
-	(   rdf_meta_specification(G, Module, Spec),
-	    right_module(LM, G, Module)
-	->  rdf_expand(G, Spec, Expanded)
-	;   debugging(rdf_meta),
-	    sub_term(G, NS:Local),
-	    atom(NS), atom(Local)
-	->  print_message(warning, rdf(meta(not_expanded(LM:G)))),
-	    fail
-	),
-	rdf_expand(G, Spec, Expanded).
+	predicate_property(LM:G, implementation_module(IM)),
+	rdf_meta_specification(G, IM, Spec),
+	rdf_expand(G, Spec, Expanded, LM).
 
 system:term_expansion(Fact, Expanded) :-
+	prolog_load_context(module, Module),
 	rdf_meta_specification(Fact, Module, Spec),
-	prolog_load_context(module, Module), !,
-	rdf_expand(Fact, Spec, Expanded).
+	rdf_expand(Fact, Spec, Expanded, Module),
+	Fact \== Expanded.
 system:term_expansion((Head :- Body), (Expanded :- Body)) :-
+	prolog_load_context(module, Module),
 	rdf_meta_specification(Head, Module, Spec),
-	prolog_load_context(module, Module), !,
-	rdf_expand(Head, Spec, Expanded).
+	rdf_expand(Head, Spec, Expanded, Module),
+	Head \== Expanded.
 
-
-right_module(M, _, M) :- !.
-right_module(LM, G, M) :-
-	predicate_property(LM:G, imported_from(M)).
-
-rdf_expand(G, Spec, Expanded) :-
+rdf_expand(G, Spec, Expanded, M) :-
 	functor(G, Name, Arity),
 	functor(Expanded, Name, Arity),
-	rdf_expand_args(0, Arity, G, Spec, Expanded).
+	rdf_expand_args(0, Arity, G, Spec, Expanded, M).
 
-rdf_expand_args(Arity, Arity, _, _, _) :- !.
-rdf_expand_args(I0, Arity, Goal, Spec, Expanded) :-
+rdf_expand_args(Arity, Arity, _, _, _, _) :- !.
+rdf_expand_args(I0, Arity, Goal, Spec, Expanded, M) :-
 	I is I0 + 1,
 	arg(I, Goal, GA),
 	arg(I, Spec, SA),
 	arg(I, Expanded, EA),
-	rdf_expand_arg(SA, GA, EA),
-	rdf_expand_args(I, Arity, Goal, Spec, Expanded).
+	rdf_expand_arg(SA, GA, EA, M),
+	rdf_expand_args(I, Arity, Goal, Spec, Expanded, M).
 
-rdf_expand_arg(r, A, E) :-
-	mk_global(A, E), !.
-rdf_expand_arg(o, A, E) :-
-	rdf_global_object(A, E), !.
-rdf_expand_arg(t, A, E) :-
-	rdf_global_term(A, E), !.
-rdf_expand_arg(g, A, E) :-
-	rdf_global_graph(A, E), !.
-rdf_expand_arg(:, A, E) :- !,
+rdf_expand_arg(r, A, E, M) :-
+	mk_global(A, E, M), !.
+rdf_expand_arg(o, A, E, M) :-
+	rdf_global_object(A, E, M), !.
+rdf_expand_arg(t, A, E, M) :-
+	rdf_global_term(A, E, M), !.
+rdf_expand_arg(g, A, E, M) :-
+	rdf_global_graph(A, E, M), !.
+rdf_expand_arg(:, A, E, _M) :- !,
 	expand_goal(A, E).
-rdf_expand_arg(_, A, A).
+rdf_expand_arg(_, A, A, _M).
 
-%%	mk_global(+Src, -Resource)
+%%	mk_global(+Src, -Resource, +Module)
 %
 %	Realised rdf_global_id(+, -), but adds compiletime checking,
 %	notably to see whether a namespace is not yet defined.
 
-mk_global(X, X) :-
+mk_global(X, X, _) :-
 	var(X), !.
-mk_global(X, X) :-
+mk_global(X, X, _) :-
 	atom(X), !.
-mk_global(NS:Local, Global) :-
-	must_be(atom, NS),
+mk_global(Prefix:Local, Global, Module) :-
+	must_be(atom, Prefix),
 	must_be(atom, Local),
-	(   ns(NS, Full)
+	(   rdf_current_prefix(Module:Prefix, Full)
 	->  atom_concat(Full, Local, Global)
 	;   current_prolog_flag(xref, true)
-	->  Global = NS:Local
-	;   existence_error(namespace, NS)
+	->  Global = Prefix:Local
+	;   existence_error(rdf_prefix, Prefix)
 	).
 
 :- rdf_meta
@@ -616,12 +759,14 @@ mk_global(NS:Local, Global) :-
 	rdf_reachable(r,r,o,+,?),
 	rdf_update(r,r,o,t),
 	rdf_update(r,r,o,+,t),
-	rdf_equal(r,r),
+	rdf_equal(o,o),
 	rdf_source_location(r,-),
 	rdf_resource(r),
 	rdf_subject(r),
 	rdf_create_graph(r),
 	rdf_graph(r),
+	rdf_graph_property(r,?),
+	rdf_set_graph(r,+),
 	rdf_unload_graph(r),
 	rdf_set_predicate(r, t),
 	rdf_predicate_property(r, -),
@@ -690,14 +835,19 @@ lang_equal(Lang1, Lang2) :-
 %
 %	For literal querying purposes, Object can be of the form
 %	literal(+Query, -Value), where Query is one of the terms below.
+%	If the Query takes a literal argument and the value has a
+%	numeric type numerical comparison is performed.
 %
 %	  * plain(+Text)
 %	  Perform exact match and demand the language or type qualifiers
 %	  to match. This query is fully indexed.
 %
-%	  * exact(+Text)
-%	  Perform exact, but case-insensitive match. This query is
+%	  * icase(+Text)
+%	  Perform a full but case-insensitive match. This query is
 %	  fully indexed.
+%
+%	  * exact(+Text)
+%	  Same as icase(Text).  Backward compatibility.
 %
 %	  * substring(+Text)
 %	  Match any literal that contains Text as a case-insensitive
@@ -717,9 +867,21 @@ lang_equal(Lang1, Lang2) :-
 %	  Match any literal that is equal or larger then Literal in the
 %	  ordered set of literals.
 %
+%	  * gt(+Literal)
+%	  Match any literal that is larger then Literal in the ordered set
+%	  of literals.
+%
+%	  * eq(+Literal)
+%	  Match any literal that is equal to Literal in the ordered set
+%	  of literals.
+%
 %	  * le(+Literal)
 %	  Match any literal that is equal or smaller then Literal in the
 %	  ordered set of literals.
+%
+%	  * lt(+Literal)
+%	  Match any literal that is smaller then Literal in the ordered set
+%	  of literals.
 %
 %	  * between(+Literal1, +Literal2)
 %	  Match any literal that is between Literal1 and Literal2 in the
@@ -918,7 +1080,7 @@ rdf_node(Resource) :-
 
 rdf_bnode(Value) :-
 	repeat,
-	gensym('__bnode', Value),
+	gensym('_:genid', Value),
 	\+ rdf(Value, _, _),
 	\+ rdf(_, _, Value),
 	\+ rdf(_, Value, _), !.
@@ -931,14 +1093,12 @@ rdf_bnode(Value) :-
 
 %%	rdf_is_bnode(+Id)
 %
-%	Tests if a resource is a blank node (i.e. is an anonymous
-%	resource).
+%	Tests if a resource is  a  blank   node  (i.e.  is  an anonymous
+%	resource). A blank node is represented   as  an atom that starts
+%	with =|_:|=. For backward compatibility   reason, =|__|= is also
+%	considered to be a blank node.
 %
 %	@see rdf_bnode/1.
-
-rdf_is_bnode(Id) :-
-	atom(Id),
-	sub_atom(Id, 0, _, _, '__').
 
 %%	rdf_is_resource(@Term) is semidet.
 %
@@ -987,7 +1147,9 @@ rdf_is_literal(literal(Value)) :-
 %	@tbd	Add mode (-,+)
 
 :- rdf_meta
-	typed_value(r, +, -).
+	rdf_literal_value(o, -),
+	typed_value(r, +, -),
+	numeric_value(r, +, -).
 
 rdf_literal_value(literal(String), Value) :-
 	atom(String), !,
@@ -1011,16 +1173,17 @@ typed_value(rdf:'XMLLiteral', Value, DOM) :-
 		close(In))
 	;   DOM = Value
 	).
-numeric_value(integer, String, Value) :-
+
+numeric_value(xsd:integer, String, Value) :-
 	atom_number(String, Value),
 	integer(Value).
-numeric_value(float, String, Value) :-
+numeric_value(xsd:float, String, Value) :-
 	atom_number(String, Number),
 	Value is float(Number).
-numeric_value(double, String, Value) :-
+numeric_value(xsd:double, String, Value) :-
 	atom_number(String, Number),
 	Value is float(Number).
-numeric_value(decimal, String, Value) :-
+numeric_value(xsd:decimal, String, Value) :-
 	atom_number(String, Value).
 
 
@@ -1298,7 +1461,7 @@ rdf_current_predicate(P, DB) :-
 %	  there are no triples the value 0.0 is returned. This value is
 %	  cached with the predicate and recomputed only after
 %	  substantial changes to the triple set associated to this
-%	  relation. This property is indented for path optimalisation
+%	  relation. This property is intended for path optimalisation
 %	  when solving conjunctions of rdf/3 goals.
 %
 %	  * rdf_object_branch_factor(-Float)
@@ -1328,10 +1491,24 @@ rdf_predicate_property(P, Prop) :-
 %%	rdf_set_predicate(+Predicate, +Property) is det.
 %
 %	Define a property of  the   predicate.  This predicate currently
-%	supports   the   properties   =symmetric=,    =inverse_of=   and
-%	=transitive= as defined with rdf_predicate_property/2. Adding an
-%	A inverse_of B also adds B inverse_of  A. An inverse relation is
-%	deleted using inverse_of([]).
+%	supports the following properties:
+%
+%	    - symmetric(+Boolean)
+%	    Set/unset the predicate as being symmetric.  Using
+%	    symmetric(true) is the same as inverse_of(Predicate),
+%	    i.e., creating a predicate that is the inverse of
+%	    itself.
+%	    - transitive(+Boolean)
+%	    Sets the transitive property.
+%	    - inverse_of(+Predicate2)
+%	    Define Predicate as the inverse of Predicate2. An inverse
+%	    relation is deleted using inverse_of([]).
+%
+%	The `transitive` property is currently not used. The `symmetric`
+%	and `inverse_of` properties are considered   by  rdf_has/3,4 and
+%	rdf_reachable/3.
+%
+%	@tbd	Maintain these properties based on OWL triples.
 
 
 		 /*******************************
@@ -1654,7 +1831,7 @@ rdf_load_db(File) :-
 %	    deduced from the filename extension or the mime-type. The
 %	    core library understands the formats xml (RDF/XML) and
 %	    triples (internal quick load and cache format).  Plugins,
-%	    such as library)semweb/turtle) extend the set of recognised
+%	    such as library(semweb/turtle) extend the set of recognised
 %	    extensions.
 %
 %	    * graph(?Graph)
@@ -2348,6 +2525,7 @@ assert_triples([H|_], _) :-
 %		start with an empty database.
 
 rdf_reset_db :-
+	reset_gensym('_:genid'),
 	rdf_reset_db_.
 
 
@@ -3268,7 +3446,8 @@ rdf_value(V, Base, Text, Encoding) :-
 	xml_quote_attribute(Local, Text, Encoding).
 rdf_value(V, _, Text, Encoding) :-
 	ns(NS, Full),
-	atom_concat(Full, Local, V), !,
+	atom_concat(Full, Local, V),
+	xml_is_name(Local), !,
 	xml_quote_attribute(Local, QLocal, Encoding),
 	atomic_list_concat(['&', NS, (';'), QLocal], Text).
 rdf_value(V, _, Q, Encoding) :-
@@ -3276,26 +3455,33 @@ rdf_value(V, _, Q, Encoding) :-
 
 
 		 /*******************************
-		 *	DEPRECATED MATERIAL	*
+		 *	 MATCH AND COMPARE	*
 		 *******************************/
 
-%%	rdf_match_label(+Method, +Search, +Atom) is semidet.
+%%	rdf_compare(-Dif, +Object1, +Object2) is det.
 %
-%	True if Search matches Atom as   defined by Method. All matching
-%	is performed case-insensitive. Defines methods are:
+%	Compare  two  object  terms.  Where  SPARQL  defines  a  partial
+%	ordering, we define a complete ordering   of terms. The ordering
+%	is defines as:
 %
-%	  * exact
-%	  Perform exact, but case-insensitive match.
-%	  * substring
-%	  Search is a sub-string of Text.
-%	  * word
-%	  Search appears as a whole-word in Text.
-%	  * prefix
-%	  Text start with Search.
-%	  * like
-%	  Text matches Search, case insensitively, where the `*'
-%	  character in Search matches zero or more characters.
+%	  - Blank nodes < IRIs < Literals
+%	  - Numeric literals < other literals
+%	  - Numeric literals are compared by value and then by type,
+%	    where Integer < Decimal < Double
+%	  - Other literals are compare lexically, case insensitive.
+%	    If equal, uppercase preceeds lowercase.  If still equal,
+%	    the types are compared lexically.
 
+%%	rdf_match_label(+How, +Pattern, +Label) is semidet.
+%
+%	True if Label matches Pattern according to   How.  How is one of
+%	`icase`, `substring`, `word`, `prefix` or   `like`. For backward
+%	compatibility, `exact` is a synonym for `icase`.
+
+
+		 /*******************************
+		 *	DEPRECATED MATERIAL	*
+		 *******************************/
 
 %%	rdf_split_url(+Prefix, +Local, -URL) is det.
 %%	rdf_split_url(-Prefix, -Local, +URL) is det.
@@ -3503,32 +3689,8 @@ rdf_url_namespace(URL, Prefix) :-
 %	generate-and-test loops slow.
 %
 %	@deprecated. New code should  use   the  library(crypt)  library
-%	provided by the clib package.
-
-
-		 /*******************************
-		 *	 SANDBOX SUPPORT	*
-		 *******************************/
-
-:- multifile
-	sandbox:safe_primitive/1.
-
-sandbox:safe_primitive(rdf_db:rdf(_,_,_)).
-sandbox:safe_primitive(rdf_db:rdf(_,_,_,_)).
-sandbox:safe_primitive(rdf_db:rdf_has(_,_,_)).
-sandbox:safe_primitive(rdf_db:rdf_has(_,_,_,_)).
-sandbox:safe_primitive(rdf_db:rdf_reachable(_,_,_)).
-sandbox:safe_primitive(rdf_db:rdf_reachable(_,_,_,_,_)).
-sandbox:safe_primitive(rdf_db:rdf_subject(_)).
-sandbox:safe_primitive(rdf_db:rdf_resource(_)).
-sandbox:safe_primitive(rdf_db:rdf_current_predicate(_)).
-sandbox:safe_primitive(rdf_db:rdf_current_literal(_)).
-sandbox:safe_primitive(rdf_db:rdf_graph(_)).
-sandbox:safe_primitive(rdf_db:rdf_generation(_)).
-sandbox:safe_primitive(rdf_db:rdf_estimate_complexity(_,_,_,_)).
-sandbox:safe_primitive(rdf_db:rdf_statistics(_)).
-sandbox:safe_primitive(rdf_db:lang_matches(_,_)).
-sandbox:safe_primitive(rdf_db:lang_equal(_,_)).
+%	provided  by  the  clib  package  for  password  encryption  and
+%	library(md5) to compute MD5 hashes.
 
 
 		 /*******************************

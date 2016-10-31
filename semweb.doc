@@ -142,11 +142,39 @@ feasible on medium hardware (Intel i7/{2600} running Ubuntu 12.10).
 
 
 		 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+		 %	     RDF API		%
+		 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\section{Two RDF APIs}
+\label{sec:semweb-rdfapi}
+
+The current `semweb' package provides two sets of interface predicates.
+The original set is described in \secref{semweb-rdf-db}. The new API is
+described in \secref{semweb-rdf11}. The original API was designed when
+RDF was not yet standardised and did not yet support data types and
+language indicators. The new API is designed from the RDF 1.1
+specification, introducing consistent naming and access to literals
+using the \jargon{value space}. The new API is currently defined on top
+of the old API, so both APIs can be mixed in a single application.
+
+
+		 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+		 %	      RDF11		%
+		 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\subsection{library(semweb/rdf11): The RDF database}
+\label{sec:semweb-rdf11}
+
+\input{rdf11}
+\input{rdf11containers}
+
+
+		 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 		 %	      RDF_DB		%
 		 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 
-\section{library(semweb/rdf_db): The RDF database}
+\subsection{library(semweb/rdf_db): The RDF database}
 \label{sec:semweb-rdf-db}
 
 \input{rdfdb}
@@ -586,7 +614,7 @@ Unify \arg{Keys} with the total key-count of the index and
 		 %%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
 
 \subsection{library(semweb/rdf_persistency): Providing persistent storage}
-\label{sec:persistency}
+\label{sec:rdfpersistency}
 
 \index{Persistent store}%
 The \pllib{semweb/rdf_persistency} provides reliable persistent storage
@@ -872,7 +900,7 @@ a list using the \const{rdf:first} and \const{rdf:next} relations.
 \begin{description}
     \predicate{rdfs_member}{2}{?Resource, +Set}
 Test or generate the members of \arg{Set}.  \arg{Set} is either an
-individual of \const{rdf:List} or \const{rdf:Container}.
+individual of \const{rdf:List} or \const{rdfs:Container}.
 
     \predicate{rdfs_list_to_prolog_list}{2}{+Set, -List}
 Convert \arg{Set}, which must be an individual of \const{rdf:List} into

@@ -1,26 +1,38 @@
 /*  Part of SWI-Prolog
 
     Author:        Jan Wielemaker
-    E-mail:        J.Wielemaker@cs.vu.nl
+    E-mail:        J.Wielemaker@vu.nl
     WWW:           http://www.swi-prolog.org
-    Copyright (C): 2013, VU University Amsterdam
+    Copyright (c)  2013-2015, VU University Amsterdam
+    All rights reserved.
 
-    This library is free software; you can redistribute it and/or
-    modify it under the terms of the GNU Lesser General Public
-    License as published by the Free Software Foundation; either
-    version 2.1 of the License, or (at your option) any later version.
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions
+    are met:
 
-    This library is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-    Lesser General Public License for more details.
+    1. Redistributions of source code must retain the above copyright
+       notice, this list of conditions and the following disclaimer.
 
-    You should have received a copy of the GNU Lesser General Public
-    License along with this library; if not, write to the Free Software
-    Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
-    MA 02110-1301 USA
+    2. Redistributions in binary form must reproduce the above copyright
+       notice, this list of conditions and the following disclaimer in
+       the documentation and/or other materials provided with the
+       distribution.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+    "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+    LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+    FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+    COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+    INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+    BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+    LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+    CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+    LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+    ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+    POSSIBILITY OF SUCH DAMAGE.
 */
 
+#include <config.h>
 #include <SWI-Stream.h>
 #include <SWI-Prolog.h>
 #include <string.h>
@@ -89,16 +101,6 @@ is_eol(int c)
 }
 
 static inline int
-is_digit(int c)
-{ return (c < 128 ? (char_type[c] & DI) != 0 : FALSE);
-}
-
-static inline int
-is_scheme_char(int c)
-{ return (c < 128 ? (char_type[c] & (LC|UC)) != 0 : FALSE);
-}
-
-static inline int
 is_lang_char1(int c)
 { return (c < 128 ? (char_type[c] & (LC|UC)) != 0 : FALSE);
 }
@@ -106,16 +108,6 @@ is_lang_char1(int c)
 static inline int
 is_lang_char(int c)
 { return (c < 128 ? (char_type[c] & (LC|UC|DI)) != 0 : FALSE) || c == '-';
-}
-
-static inline int
-is_local_escape(int c)
-{ return (c < 128 ? (char_type[c] & EC) != 0 : FALSE);
-}
-
-static inline int
-is_iri_char(int c)
-{ return (c < 128 ? (char_type[c] & NI) == 0 : TRUE);
 }
 
 static const char hexval0[] =
@@ -139,30 +131,28 @@ hexd(int c)
 
 
 static inline int
-wcis_pn_chars_u(int c)			/* 164s */
+wcis_pn_chars_u(int c)			/* 158s */
 { return ( wcis_pn_chars_base(c) ||
-	   c == '_'
+	   c == '_' || c == ':'
 	 );
 }
 
+
+static inline int			/* 141s RDF Blank Nodes */
+wcis_pn_chars_du(int c)
+{ return ( wcis_pn_chars_u(c) ||
+	   (c >= '0' && c <= '9')
+	 );
+}
 
 static inline int
-wcis_pn_chars(int c)
+wcis_pn_chars(int c)			/* 160s */
 { return ( wcis_pn_chars_u(c) ||
-	   wcis_pn_chars_extra(c)
-	 );
-}
-
-
-static inline int			/* 2.4 RDF Blank Nodes */
-wcis_pn_chars_du(int c)
-{ return ( wcis_pn_chars_base(c) ||
+	   c == '-' ||
 	   (c >= '0' && c <= '9') ||
-	   c == '_' ||
 	   wcis_pn_chars_extra(c)
 	 );
 }
-
 
 		 /*******************************
 		 *	      ERROR		*
@@ -481,10 +471,10 @@ read_node_id(IOSTREAM *in, term_t subject, int *cp)
 
       c = Sgetcode(in);
 
-      if ( wcis_pn_chars_du(c) )
+      if ( wcis_pn_chars(c) )
       { addBuf(&buf, c);
       } else if ( c == '.' &&
-		  (wcis_pn_chars_du((c2=Speekcode(in))) || c2 == '.') )
+		  (wcis_pn_chars((c2=Speekcode(in))) || c2 == '.') )
       { addBuf(&buf, c);
       } else
       { term_t av = PL_new_term_refs(1);
@@ -511,6 +501,8 @@ read_lan(IOSTREAM *in, term_t lan, int *cp)
   int rc;
 
   c = Sgetcode(in);
+  if ( !skip_ws(in, &c) )
+    return FALSE;
   if ( !is_lang_char1(c) )
     return syntax_error(in, "language tag must start with a-zA-Z");
 
@@ -661,6 +653,11 @@ read_literal(IOSTREAM *in, term_t literal, int *cp)
       { case '"':
 	{ c = Sgetcode(in);
 
+	  if ( !skip_ws(in, &c) )
+	  { discardBuf(&buf);
+	    return FALSE;
+	  }
+
 	  switch(c)
 	  { case '@':
 	    { term_t av = PL_new_term_refs(2);
@@ -685,6 +682,10 @@ read_literal(IOSTREAM *in, term_t literal, int *cp)
 	      { term_t av = PL_new_term_refs(2);
 
 		c = Sgetcode(in);
+		if ( !skip_ws(in, &c) )
+		{ discardBuf(&buf);
+		  return FALSE;
+		}
 		if ( c == '<' )
 		{ if ( read_uniref(in, av+0, cp) )
 		  { int rc = ( PL_unify_wchars(av+1, PL_ATOM,

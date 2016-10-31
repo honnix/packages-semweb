@@ -1,24 +1,35 @@
 /*  Part of SWI-Prolog
 
     Author:        Jan Wielemaker
-    E-mail:        J.Wielemaker@cs.vu.nl
+    E-mail:        J.Wielemaker@vu.nl
     WWW:           http://www.swi-prolog.org
-    Copyright (C): 2011, VU University Amsterdam
+    Copyright (c)  2011-2015, VU University Amsterdam
+    All rights reserved.
 
-    This library is free software; you can redistribute it and/or
-    modify it under the terms of the GNU Lesser General Public
-    License as published by the Free Software Foundation; either
-    version 2.1 of the License, or (at your option) any later version.
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions
+    are met:
 
-    This library is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-    Lesser General Public License for more details.
+    1. Redistributions of source code must retain the above copyright
+       notice, this list of conditions and the following disclaimer.
 
-    You should have received a copy of the GNU Lesser General Public
-    License along with this library; if not, write to the Free Software
-    Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston,
-    MA 02110-1301 USA
+    2. Redistributions in binary form must reproduce the above copyright
+       notice, this list of conditions and the following disclaimer in
+       the documentation and/or other materials provided with the
+       distribution.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+    "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+    LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+    FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+    COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+    INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+    BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+    LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+    CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+    LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+    ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+    POSSIBILITY OF SUCH DAMAGE.
 */
 
 /* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
@@ -185,10 +196,15 @@ init_query_stack(rdf_db *db, query_stack *qs)
 }
 
 
-query *
+static query *
 alloc_query(query_stack *qs)
 { int depth = qs->top;
   int b = MSB(depth);
+
+  if ( b >= MAX_QBLOCKS )
+  { PL_resource_error("open_rdf_queries");
+    return NULL;
+  }
 
   if ( qs->blocks[b] )
   { query *q = &qs->blocks[b][depth];
@@ -201,9 +217,15 @@ alloc_query(query_stack *qs)
   simpleMutexLock(&qs->lock);
   if ( !qs->blocks[b] )
   { size_t bytes = BLOCKLEN(b) * sizeof(query);
-    query *ql = PL_malloc_uncollectable(bytes);
+    query *ql = rdf_malloc(qs->db, bytes);
     query *parent;
     int i;
+
+    if ( !ql )
+    { simpleMutexUnlock(&qs->lock);
+      PL_resource_error("memory");
+      return NULL;
+    }
 
     memset(ql, 0, bytes);
     ql -= depth;			/* rebase */
@@ -242,6 +264,7 @@ open_query(rdf_db *db)
   thread_info *ti = rdf_thread_info(db, tid);
   query *q = alloc_query(&ti->queries);
 
+  if ( !q ) return NULL;
   q->type = Q_NORMAL;
   q->transaction = ti->queries.transaction;
   q->reindex_gen = db->reindexed;
@@ -271,6 +294,7 @@ open_transaction(rdf_db *db,
   thread_info *ti = rdf_thread_info(db, tid);
   query *q = alloc_query(&ti->queries);
 
+  if ( !q ) return NULL;
   q->type = Q_TRANSACTION;
   q->transaction = ti->queries.transaction;
   q->reindex_gen = GEN_MAX;		/* should not get this down */
@@ -854,7 +878,7 @@ discard_transaction(query *q)
     if ( is_wr_transaction_gen(q, t->lifespan.died) )
     { t = deref_triple(db, t);
 
-      t->lifespan.died = GEN_MAX;
+      t->lifespan.died = gen_max;
     }
   }
 
@@ -868,7 +892,7 @@ discard_transaction(query *q)
     if ( is_wr_transaction_gen(q, to->lifespan.died) )
     { to = deref_triple(db, to);
 
-      to->lifespan.died = GEN_MAX;
+      to->lifespan.died = gen_max;
     }
 					/* revert creation of new */
     if ( is_wr_transaction_gen(q, tn->lifespan.born) &&

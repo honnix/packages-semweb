@@ -1,30 +1,35 @@
 /*  Part of SWI-Prolog
 
     Author:        Jan Wielemaker
-    E-mail:        J.Wielemaker@cs.vu.nl
+    E-mail:        J.Wielemaker@vu.nl
     WWW:           http://www.swi-prolog.org
-    Copyright (C): 2014 VU University Amsterdam
+    Copyright (c)  2014-2015, VU University Amsterdam
+    All rights reserved.
 
-    This program is free software; you can redistribute it and/or
-    modify it under the terms of the GNU General Public License
-    as published by the Free Software Foundation; either version 2
-    of the License, or (at your option) any later version.
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions
+    are met:
 
-    This program is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-    GNU General Public License for more details.
+    1. Redistributions of source code must retain the above copyright
+       notice, this list of conditions and the following disclaimer.
 
-    You should have received a copy of the GNU Lesser General Public
-    License along with this library; if not, write to the Free Software
-    Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301  USA
+    2. Redistributions in binary form must reproduce the above copyright
+       notice, this list of conditions and the following disclaimer in
+       the documentation and/or other materials provided with the
+       distribution.
 
-    As a special exception, if you link this library with other files,
-    compiled with a Free Software compiler, to produce an executable, this
-    library does not by itself cause the resulting executable to be covered
-    by the GNU General Public License. This exception does not however
-    invalidate any other reasons why the executable file might be covered by
-    the GNU General Public License.
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+    "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+    LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+    FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+    COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+    INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+    BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+    LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+    CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+    LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+    ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+    POSSIBILITY OF SUCH DAMAGE.
 */
 
 :- module(rdfa,
@@ -71,8 +76,13 @@ load_xml/3.
 		       vocab(atom),
 		       markup(atom)
 		     ]).
+:- predicate_options(read_dom/3, 3,
+		     [ pass_to(load_html/3, 3),
+		       pass_to(load_xml/3, 3)
+		     ]).
 :- predicate_options(read_rdfa/3, 3,
-		     [ pass_to(xml_rdfa/3, 3),
+		     [ pass_to(read_dom/3, 3),
+		       pass_to(xml_rdfa/3, 3),
 		       pass_to(system:open/4, 4),
 		       pass_to(http_open:http_open/3, 3)
 		     ]).
@@ -98,31 +108,50 @@ read_rdfa(Input, Triples, Options) :-
 	merge_options(NewOptions, Options, RDFaOptions),
 	xml_rdfa(DOM, Triples, RDFaOptions).
 
-open_input(stream(In), In, Options, true, _) :- !,
+open_input(Input, In, NewOptions, Close, Options) :-
+	open_input2(Input, In, NewOptions, Close0, Options),
+	detect_bom(In, Close0, Close).
+
+open_input2(stream(In), In, Options, true, _) :- !,
 	(   stream_property(In, file_name(Name)),
 	    to_uri(Name, URI)
 	->  Options = [base(URI)]
 	;   Options = []
 	).
-open_input(In, In, Options, true, _) :-
+open_input2(In, In, Options, true, _) :-
 	is_stream(In), !,
 	(   stream_property(In, file_name(Name)),
 	    to_uri(Name, URI)
 	->  Options = [base(URI)]
 	;   Options = []
 	).
-open_input(URL, In, [base(URL)], close(In), Options) :-
+open_input2(URL, In, [base(URL)], close(In), Options) :-
 	atom(URL),
 	uri_file_name(URL, File), !,
 	open(File, read, In, Options).
-open_input(URL, In, [base(Base)], close(In), Options) :-
+open_input2(URL, In, [base(Base)], close(In), Options) :-
 	atom(URL),
 	to_uri2(URL, Base), !,
 	http_open(URL, In, Options).
-open_input(File, In, [base(URI)], close(In), Options) :-
+open_input2(File, In, [base(URI)], close(In), Options) :-
 	absolute_file_name(File, Path, [access(read)]),
 	uri_file_name(URI, Path),
 	open(Path, read, In, Options).
+
+%%	detect_bom(+In, +Close0, -Close) is det.
+%
+%	We may be loading a binary stream. In   that  case we want to do
+%	BOM detection.
+
+detect_bom(In, Close0, Close) :-
+	stream_property(In, type(binary)),
+	stream_property(In, encoding(Enc)),
+	catch(set_stream(In, encoding(bom)),_,fail), !,
+	merge_close(Close0, set_stream(In, encoding(Enc)), Close).
+detect_bom(_, Close, Close).
+
+merge_close(true, Close, Close) :- !.
+merge_close(Close, _, Close).
 
 to_uri(URI0, URI) :-
 	to_uri2(URI0, URI), !.
@@ -142,6 +171,7 @@ http_scheme(https).
 
 close_input(true).
 close_input(close(X)) :- close(X).
+close_input(set_stream(In, encoding(Enc))) :- set_stream(In, encoding(Enc)).
 
 read_dom(In, DOM, Options) :-
 	option(dialect(Dialect), Options), !,
@@ -165,7 +195,9 @@ guess_dialect(Start, Dialect) :-
 	Dialect = xml.
 guess_dialect(Start, Dialect) :-
 	sub_string(Start, _, _, _, "<html"), !,
-	(   string_codes(Start, Codes),
+	(   sub_string(Start, _, _, _, "xmlns:")
+	->  Dialect = xhtml
+	;   string_codes(Start, Codes),
 	    phrase(html_doctype(DialectFound), Codes, _)
 	->  Dialect = DialectFound
 	;   Dialect = html
@@ -629,7 +661,8 @@ step_7_5_9(DOM, Context) :-
 	memberchk(inlist=_, Attrs),
 	has_attribute(rel, Attrs, Rel, Context), !,
 	iri_list(Rel, Preds, Context),
-	maplist(add_property_list(Context, Context.current_object_resource),
+	CurrentObjectResource = Context.current_object_resource,
+	maplist(add_property_list(Context, CurrentObjectResource),
 		Preds).
 step_7_5_9(DOM, Context) :-
 	DOM = element(_,Attrs,_),
@@ -751,13 +784,15 @@ update_property_value(DOM, Context) :-
 	    Obj0 = literal(Text)
 	),
 	(   Obj0 = literal(Text),
+	    atomic(Text),
 	    Context.lang \== ''
 	->  Obj = literal(lang(Context.lang, Text))
 	;   Obj = Obj0
 	),
 	(   memberchk(inlist=_, Attrs)
 	->  maplist(add_property_list(Context, Obj), Preds)
-	;   maplist(add_property(Context, Context.new_subject, Obj), Preds)
+	;   NewSubject = Context.new_subject,
+	    maplist(add_property(Context, NewSubject, Obj), Preds)
 	).
 update_property_value(_, _).
 

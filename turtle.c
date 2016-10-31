@@ -3,22 +3,33 @@
     Author:        Jan Wielemaker
     E-mail:        J.Wielemaker@vu.nl
     WWW:           http://www.swi-prolog.org
-    Copyright (C): 2013-2014, VU University Amsterdam
+    Copyright (c)  2009-2015, VU University Amsterdam
+    All rights reserved.
 
-    This library is free software; you can redistribute it and/or
-    modify it under the terms of the GNU Lesser General Public
-    License as published by the Free Software Foundation; either
-    version 2.1 of the License, or (at your option) any later version.
+    Redistribution and use in source and binary forms, with or without
+    modification, are permitted provided that the following conditions
+    are met:
 
-    This library is distributed in the hope that it will be useful,
-    but WITHOUT ANY WARRANTY; without even the implied warranty of
-    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
-    Lesser General Public License for more details.
+    1. Redistributions of source code must retain the above copyright
+       notice, this list of conditions and the following disclaimer.
 
-    You should have received a copy of the GNU Lesser General Public
-    License along with this library; if not, write to the Free Software
-    Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA
-    02110-1301  USA
+    2. Redistributions in binary form must reproduce the above copyright
+       notice, this list of conditions and the following disclaimer in
+       the documentation and/or other materials provided with the
+       distribution.
+
+    THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+    "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+    LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS
+    FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE
+    COPYRIGHT OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT,
+    INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING,
+    BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES;
+    LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
+    CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
+    LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN
+    ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE
+    POSSIBILITY OF SUCH DAMAGE.
 */
 
 #include <config.h>
@@ -1128,7 +1139,7 @@ make_absolute_resource(turtle_state *ts, const wchar_t *uri)
 
 static void	clear_turtle_parser(turtle_state *ts);
 static int	init_base_uri(turtle_state *ts);
-static int	read_predicate_object_list(turtle_state *ts, int end);
+static int	read_predicate_object_list(turtle_state *ts, const char *end);
 static int	read_object(turtle_state *ts);
 static int	set_subject(turtle_state *ts, resource *r, resource **old);
 static int	set_predicate(turtle_state *ts, resource *r, resource **old);
@@ -1922,7 +1933,7 @@ read_blank_node_property_list(turtle_state *ts)
 
   rc = ( set_anon_subject(ts, &olds) &&
 	 set_predicate(ts, NULL, &oldp) &&
-	 read_predicate_object_list(ts, ']')
+	 read_predicate_object_list(ts, "]")
        );
   set_subject(ts, olds, &bnode);
   set_predicate(ts, oldp, NULL);
@@ -2440,10 +2451,15 @@ read_object(turtle_state *ts)
       if ( read_string(ts, &text) )
       { int rc;
 
+	if ( !skip_ws(ts) )
+	{ discardBuf(&text);
+	  return FALSE;
+	}
+
 	if ( ts->current_char == '@' )
 	{ string_buffer lang;
 
-	  if ( (rc = next(ts) && read_lang(ts, &lang)) )
+	  if ( (rc = next(ts) && skip_ws(ts) && read_lang(ts, &lang)) )
 	  { rc = got_lang_triple(ts,
 				 bufSize(&text)-1, baseBuf(&text),
 				 baseBuf(&lang));
@@ -2453,7 +2469,7 @@ read_object(turtle_state *ts)
 	{ if ( next(ts) && ts->current_char == '^' )
 	  { resource *r;
 
-	    if ( next(ts) && (r=read_iri(ts, 0)) )
+	    if ( next(ts) && skip_ws(ts) && (r=read_iri(ts, 0)) )
 	    { rc = got_typed_triple(ts, bufSize(&text)-1, baseBuf(&text), r);
 	      free_resource(ts, r);
 	    } else
@@ -2520,7 +2536,7 @@ read_object_list(turtle_state *ts)
 
 
 static int
-read_predicate_object_list(turtle_state *ts, int end)
+read_predicate_object_list(turtle_state *ts, const char *end)
 { for(;;)
   { if ( !read_verb(ts)	||
 	 !read_object_list(ts) ||
@@ -2530,7 +2546,7 @@ read_predicate_object_list(turtle_state *ts, int end)
     if ( ts->current_char == ';' )
     { empty:
       if ( next(ts) && skip_ws(ts) )
-      { if ( ts->current_char == end )
+      { if ( ts->current_char <= 256 && strchr(end, ts->current_char) )
 	  return TRUE;
 	if ( ts->current_char == ';' )
 	  goto empty;
@@ -2695,8 +2711,20 @@ the subject.
 
 static int
 final_predicate_object_list(turtle_state *ts)
-{ return ( read_predicate_object_list(ts, '.') &&
-	   read_end_of_clause(ts) );
+{ const char *end;
+
+  if ( ts->format == D_TRIG && ts->current_graph )
+    end = "}.";
+  else
+    end = ".";
+
+  if ( !read_predicate_object_list(ts, end) )
+    return FALSE;
+
+  if ( ts->current_char == '}' && ts->format == D_TRIG && ts->current_graph )
+    return TRUE;
+
+  return read_end_of_clause(ts);
 }
 
 
@@ -3020,7 +3048,8 @@ unify_turtle_parser(term_t parser, turtle_state *ts)
 { parser_symbol *ps;
 
   if ( (ps=malloc(sizeof(*ps))) )
-  { ps->magic = PARSER_MAGIC;
+  { memset(ps, 0, sizeof(*ps));		/* ensure padding is initialized */
+    ps->magic = PARSER_MAGIC;
     ps->state = ts;
 
     return PL_unify_blob(parser, ps, sizeof(*ps), &turtle_blob);
@@ -3044,7 +3073,7 @@ create_turtle_parser(term_t parser, term_t in, term_t options)
 
       while(PL_get_list_ex(opts, opt, opts))
       { atom_t name;
-	int arity;
+	size_t arity;
 
 	if ( PL_get_name_arity(opt, &name, &arity) )
 	{ if ( arity == 1 )
@@ -3177,7 +3206,7 @@ turtle_parse(term_t parser, term_t triples, term_t options)
 
     while(PL_get_list_ex(opts, opt, opts))
     { atom_t name;
-      int arity;
+      size_t arity;
 
       if ( PL_get_name_arity(opt, &name, &arity) )
       { if ( arity == 1 )
@@ -3443,6 +3472,7 @@ ttl_put_character(IOSTREAM *s, int c)
 static int
 ttl_put_echaracter(IOSTREAM *s, int c)
 { int c2;
+  int rc;
 
   switch(c)
   { case '\t': c2 = 't'; break;
@@ -3452,7 +3482,8 @@ ttl_put_echaracter(IOSTREAM *s, int c)
       return ttl_put_character(s, c);
   }
 
-  Sputcode('\\', s);
+  if ( (rc=Sputcode('\\', s)) < 0 )
+    return rc;
 
   return Sputcode(c2, s);
 }
@@ -3460,12 +3491,16 @@ ttl_put_echaracter(IOSTREAM *s, int c)
 
 static int
 ttl_put_scharacter(IOSTREAM *s, int c)
-{ switch(c)
+{ int rc;
+
+  switch(c)
   { case '"':
-      Sputcode('\\', s);
+      if ( (rc=Sputcode('\\', s)) < 0 )
+	return rc;
       return Sputcode('"', s);
     case '\\':
-      Sputcode('\\', s);
+      if ( (rc=Sputcode('\\', s)) < 0 )
+	return rc;
       return Sputcode('\\', s);
     default:
       return ttl_put_echaracter(s, c);
@@ -3479,6 +3514,9 @@ write_long_q(IOSTREAM *out)
   Sputcode('"', out);
   Sputcode('"', out);
 }
+
+#define StryPutcode(c, s) \
+	do { if ( Sputcode(c,s) < 0 ) goto error; } while(0)
 
 static foreign_t
 turtle_write_quoted_string(term_t Stream, term_t Value, term_t wlong)
@@ -3518,24 +3556,25 @@ turtle_write_quoted_string(term_t Stream, term_t Value, term_t wlong)
     { write_long_q(out);
       for(s=textA; s<e; s++)
       { if ( *s == '"' && ((s+1<e && s[1] != '"') || (s+2<e && s[2] != '"')) )
-	  Sputcode('"', out);
+	  StryPutcode('"', out);
 	else if ( *s == '\n' || *s == '\r' )
-	  Sputcode(*s, out);
+	  StryPutcode(*s, out);
 	else if ( ttl_put_scharacter(out, s[0]&0xff) < 0 )
-	  break;
+	  goto error;
       }
       write_long_q(out);
     } else
-    { Sputcode('"', out);
+    { StryPutcode('"', out);
       for(s=textA; s<e; s++)
       { if ( ttl_put_scharacter(out, s[0]&0xff) < 0 )
-	  break;
+	  goto error;
       }
-      Sputcode('"', out);
+      StryPutcode('"', out);
     }
 
     return PL_release_stream(out);
-  } else if ( PL_get_wchars(Value, &len, &textW, CVT_ATOM|CVT_EXCEPTION) )
+  } else if ( PL_get_wchars(Value, &len, &textW,
+			    CVT_ATOM|CVT_STRING|CVT_EXCEPTION) )
   { const pl_wchar_t *e = &textW[len];
     const pl_wchar_t *w;
 
@@ -3559,25 +3598,26 @@ turtle_write_quoted_string(term_t Stream, term_t Value, term_t wlong)
     { write_long_q(out);
       for(w=textW; w<e; w++)
       { if ( *w == '"' && ((w+1<e && w[1] != '"') || (w+2<e && w[2] != '"')) )
-	  Sputcode('"', out);
+	  StryPutcode('"', out);
 	else if ( *w == '\n' || *w == '\r' )
-	  Sputcode(*w, out);
+	  StryPutcode(*w, out);
 	else if ( ttl_put_scharacter(out, w[0]) < 0 )
-	  break;
+	  goto error;
       }
       write_long_q(out);
     } else
-    { Sputcode('"', out);
+    { StryPutcode('"', out);
       for(w=textW; w<e; w++)
       { if ( ttl_put_scharacter(out, w[0]) < 0 )
-	  break;
+	  goto error;
       }
-      Sputcode('"', out);
+      StryPutcode('"', out);
     }
 
     return PL_release_stream(out);
   } else
-  { PL_release_stream(out);
+  { error:
+    PL_release_stream(out);
     return FALSE;
   }
 }
@@ -3585,10 +3625,13 @@ turtle_write_quoted_string(term_t Stream, term_t Value, term_t wlong)
 
 static int
 ttl_put_ucharacter(IOSTREAM *s, int c)
-{ switch(c)
+{ int rc;
+
+  switch(c)
   { case '>':
     case '\\':
-      Sputcode('\\', s);
+      if ( (rc=Sputcode('\\', s)) < 0 )
+	return rc;
       return Sputcode(c, s);
     default:
       return ttl_put_character(s, c);
@@ -3612,25 +3655,26 @@ turtle_write_uri(term_t Stream, term_t Value)
   if ( PL_get_nchars(Value, &len, &s, CVT_ATOM|CVT_STRING) )
   { const char *e = &s[len];
 
-    Sputcode('<', out);
+    StryPutcode('<', out);
     for(; s<e; s++)
     { if ( ttl_put_ucharacter(out, s[0]&0xff) < 0 )
-	break;
+	goto error;
     }
-    Sputcode('>', out);
+    StryPutcode('>', out);
     return PL_release_stream(out);
   } else if ( PL_get_wchars(Value, &len, &w, CVT_ATOM|CVT_EXCEPTION) )
   { const pl_wchar_t *e = &w[len];
 
-    Sputcode('<', out);
+    StryPutcode('<', out);
     for(; w<e; w++)
     { if ( ttl_put_ucharacter(out, w[0]) < 0 )
-	break;
+	goto error;
     }
-    Sputcode('>', out);
+    StryPutcode('>', out);
     return PL_release_stream(out);
   } else
-  { PL_release_stream(out);
+  { error:
+    PL_release_stream(out);
     return FALSE;
   }
 }

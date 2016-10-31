@@ -3,7 +3,7 @@
     Author:        Jan Wielemaker
     E-mail:        J.Wielemaker@vu.nl
     WWW:           http://www.swi-prolog.org
-    Copyright (c)  2007-2012, University of Amsterdam
+    Copyright (c)  2016, VU University Amsterdam
     All rights reserved.
 
     Redistribution and use in source and binary forms, with or without
@@ -32,42 +32,45 @@
     POSSIBILITY OF SUCH DAMAGE.
 */
 
-#ifndef HASH_H_INCLUDED
-#define HASH_H_INCLUDED
+#ifndef XSD_H_INCLUDED
+#define XSD_H_INCLUDED
 
-typedef struct ptr_hash_node
-{ struct ptr_hash_node *next;		/* next in chain */
-  void *value;				/* hashed value */
-} ptr_hash_node;
+#include <SWI-Prolog.h>
 
+#ifndef SO_LOCAL
+#ifdef HAVE_VISIBILITY_ATTRIBUTE
+#define SO_LOCAL __attribute__((visibility("hidden")))
+#else
+#define SO_LOCAL
+#endif
+#define COMMON(type) SO_LOCAL type
+#endif
 
-typedef struct ptr_hash_table
-{ int entries;				/* # chains  */
-  ptr_hash_node **chains;		/* hash chains */
-} ptr_hash_table;
+#include "atom.h"
 
-ptr_hash_table *new_ptr_hash(int entries);
-void		destroy_ptr_hash(ptr_hash_table *hash);
-int		add_ptr_hash(ptr_hash_table *hash, void *value);
-int		for_ptr_hash(ptr_hash_table *hash,
-			     int (*func)(ptr_hash_node *node, void *closure),
-			     void *closure);
+#define URL_xsd		  "http://www.w3.org/2001/XMLSchema#"
+#define URL_xsdString     URL_xsd "string"
+#define URL_xsdDouble     URL_xsd "double"
 
-		 /*******************************
-		 *	       ATOMS		*
-		 *******************************/
+typedef enum xsd_primary
+{ XSD_NONNUMERIC = 0,
+  XSD_INTEGER,
+  XSD_DECIMAL,
+  XSD_DOUBLE
+} xsd_primary;
 
-typedef ptr_hash_table atom_hash_table;
-#define new_atom_hash(entries) new_ptr_hash(entries, ATOM_HASH_SHIFT)
-#define destroy_atom_hash(hash) destroy_ptr_hash(hash)
-#define add_atom_hash(hash, atom) add_ptr_hash(hash, (void*)(atom))
-#define for_atom_hash for_ptr_hash
+typedef struct xsd_type
+{ const char   *url;			/* URL */
+  atom_t	url_atom;		/* As an atom */
+  xsd_primary	primary;		/* primary type */
+  int64_t	min_value;		/* min for restricted integers */
+  int64_t	max_value;		/* max for restricted integers */
+} xsd_type;
 
-
-/* - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
-SWI-Prolog note: Atoms are integers shifted by LMASK_BITS (7)
-- - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - */
-
-#define POINTER_HASH_SHIFT 3
-
-#endif /*HASH_H_INCLUDED*/
+COMMON(xsd_primary)	is_numeric_type(atom_t type);
+COMMON(int)		xsd_compare_numeric(
+			    xsd_primary type1, const unsigned char *s1,
+			    xsd_primary type2, const unsigned char *s2);
+COMMON(int)		cmp_xsd_info(xsd_primary type1, atom_info *v1,
+				     xsd_primary type2, atom_t v2);
+#endif /*XSD_H_INCLUDED*/
